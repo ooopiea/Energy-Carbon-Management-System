@@ -1,0 +1,7 @@
+# 根目录 .gitignore（SPEC_SCENARIOS D7：只推送 v2_energy_agent/）
+# 白名单策略：默认忽略根目录所有内容，仅放行 v2_energy_agent/ 与本文件
+# 比逐项排除更稳：无论根目录再冒出什么散落文件（data/、outputs/、PPT 等）都不会漏进仓库
+
+/*
+!.gitignore
+!v2_energy_agent/

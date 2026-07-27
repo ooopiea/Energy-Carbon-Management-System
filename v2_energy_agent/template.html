@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V2 园区能源调度 · 控制台</title>
+<style>
+:root{
+  --bg:#0e1410; --surface:#161d18; --surface2:#1d2722; --border:#28332d;
+  --fg:#dde5dd; --fg2:#7a8a80; --fg3:#506058;
+  --node:#3dd9c4; --energy:#f0a830; --carbon:#7ab87a; --human:#e8835f; --danger:#e85f5f;
+  --node-d:#1a6b5e; --energy-d:#5e4316; --carbon-d:#2f4a2f; --human-d:#5e3424;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-weight:300;line-height:1.5;min-height:100vh}
+.mono{font-family:'Cascadia Code','Consolas','DejaVu Sans Mono',monospace}
+.display{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}
+.wrap{max-width:1440px;margin:0 auto;padding:24px 28px 60px}
+header.top{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid var(--border);margin-bottom:28px}
+.brand{display:flex;align-items:baseline;gap:14px}
+.brand h1{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;font-size:22px;font-weight:600;letter-spacing:-.3px}
+.brand .ver{font-family:'Cascadia Code','Consolas','DejaVu Sans Mono',monospace;font-size:11px;color:var(--node);background:var(--node-d);padding:2px 8px;border-radius:3px;font-weight:500}
+.top-meta{display:flex;align-items:center;gap:20px;font-size:13px;color:var(--fg2)}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px}
+.dot.ok{background:var(--node);box-shadow:0 0 8px var(--node)}
+.tabs{display:flex;gap:0;margin-bottom:24px;border:1px solid var(--border);border-radius:6px;overflow:hidden;width:fit-content}
+.tab{padding:10px 20px;font-size:13px;font-weight:500;cursor:pointer;background:var(--surface);color:var(--fg2);border:none;border-right:1px solid var(--border);transition:all .2s;font-family:inherit}
+.tab:last-child{border-right:none}
+.tab:hover{color:var(--fg);background:var(--surface2)}
+.tab.active{background:var(--node-d);color:var(--node)}
+.grid-main{display:grid;grid-template-columns:1fr 420px;gap:24px;margin-bottom:28px}
+@media(max-width:1100px){.grid-main{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px}
+.panel-title{font-size:12px;font-weight:500;color:var(--fg2);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
+@media(max-width:768px){.kpis{grid-template-columns:repeat(2,1fr)}}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px 14px}
+.kpi .label{font-size:11px;color:var(--fg2);margin-bottom:6px}
+.kpi .val{font-family:'Cascadia Code','Consolas','DejaVu Sans Mono',monospace;font-size:22px;font-weight:500}
+.kpi .val.pos{color:var(--energy)}
+.kpi .val.neg{color:var(--danger)}
+.kpi .val.carbon{color:var(--carbon)}
+.kpi .sub{font-size:10px;color:var(--fg3);margin-top:4px}
+#graph-svg{width:100%;height:auto;display:block}
+.node-rect{transition:all .2s;cursor:pointer}
+.node-rect:hover{filter:brightness(1.3)}
+.edge-line{transition:all .2s;cursor:pointer}
+.edge-line:hover{stroke-width:3}
+.edge-label{font-size:9px;fill:var(--fg2);font-family:'Cascadia Code','Consolas','DejaVu Sans Mono',monospace}
+.steps{display:flex;flex-direction:column;gap:0}
+.step{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);position:relative;cursor:pointer;transition:background .15s}
+.step:hover{background:var(--surface2)}
+.step:last-child{border-bottom:none}
+.step-dot{width:10px;height:10px;border-radius:50%;background:var(--node);margin-top:4px;flex-shrink:0;position:relative;z-index:1}
+.step-dot.human{background:var(--human)}
+.step-content .st-title{font-size:13px;font-weight:500;margin-bottom:2px}
+.step-content .st-detail{font-size:11px;color:var(--fg2);line-height:1.4}
+.step.active{background:var(--surface2);border-left:2px solid var(--node);padding-left:8px}
+.chart-row{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}
+@media(max-width:900px){.chart-row{grid-template-columns:1fr}}
+.chart-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:18px}
+.chart-box h3{font-size:13px;font-weight:500;margin-bottom:4px;display:flex;align-items:center;gap:6px}
+.chart-box .desc{font-size:11px;color:var(--fg2);margin-bottom:12px}
+canvas{width:100%;height:280px;display:block}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--fg2)}
+.legend span{display:flex;align-items:center;gap:5px}
+.legend i{width:10px;height:3px;border-radius:1px;display:inline-block}
+.tooltip{position:fixed;background:#0a0e0c;border:1px solid var(--node);border-radius:6px;padding:10px 14px;font-size:12px;pointer-events:none;z-index:100;max-width:320px;box-shadow:0 4px 20px rgba(0,0,0,.5);display:none;line-height:1.5}
+.tooltip strong{color:var(--node);font-size:13px;display:block;margin-bottom:4px}
+.tooltip .tt-type{color:var(--fg3);font-size:10px;font-family:'Cascadia Code','Consolas','DejaVu Sans Mono',monospace;text-transform:uppercase}
+.approval-box{background:var(--surface);border:1px solid var(--human-d);border-radius:8px;padding:20px;margin-bottom:20px}
+.approval-box h3{color:var(--human);font-size:14px;margin-bottom:12px}
+.decision{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:4px;font-size:12px;font-weight:500;font-family:'Cascadia Code','Consolas','DejaVu Sans Mono',monospace}
+.decision.approve{background:var(--node-d);color:var(--node)}
+.decision.revise{background:var(--energy-d);color:var(--energy)}
+.decision.reject{background:#5e2424;color:var(--danger)}
+.note{font-size:12px;color:var(--fg2);padding:12px 16px;background:var(--surface2);border-left:3px solid var(--fg3);border-radius:0 4px 4px 0;margin:12px 0}
+.note strong{color:var(--fg)}
+.rt-bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 18px;margin-bottom:20px}
+.rt-bar label{font-size:12px;color:var(--fg2);white-space:nowrap}
+.rt-bar input[type=date]{background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--fg);padding:6px 10px;font-size:13px;font-family:inherit}
+.rt-bar .rt-btn{padding:6px 16px;border-radius:5px;border:1px solid var(--node);background:var(--node-d);color:var(--node);font-size:12px;font-weight:500;cursor:pointer;font-family:inherit;white-space:nowrap}
+.rt-bar .rt-btn:hover{filter:brightness(1.2)}
+.rt-bar .rt-btn:disabled{opacity:.4;cursor:default}
+.rt-bar .rt-status{font-size:11px;color:var(--fg2);font-family:'Cascadia Code','Consolas',monospace}
+.rt-bar .rt-badge{font-size:10px;padding:2px 8px;border-radius:3px;background:var(--node-d);color:var(--node);white-space:nowrap}
+footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--border);font-size:11px;color:var(--fg3);display:flex;justify-content:space-between}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="top">
+<div class="brand">
+<h1>园区能源调度控制台</h1>
+<span class="ver">V2.1.0</span>
+<span class="mono" style="font-size:11px;color:var(--fg2)">MILP + 电碳双因子 + LangGraph</span>
+</div>
+<div class="top-meta">
+<span><span class="dot ok"></span>系统就绪</span>
+<span class="mono">2026-07-27</span>
+<span class="mono">黄花园区 · cn-hunan</span>
+</div>
+</header>
+<div class="tabs">
+<button class="tab active" onclick="switchCase('case1')">案例 1 · 储能经济调度</button>
+<button class="tab" onclick="switchCase('case2')">案例 2 · 电碳感知调度</button>
+<button class="tab" onclick="switchCase('case3')">案例 3 · LLM 修改解析</button>
+</div>
+<div class="kpis" id="kpis"></div>
+<div class="panel" style="margin-bottom:24px;padding:16px 20px" id="tariff-panel"><div class="panel-title">电费组成（日度/月度分离）</div><div id="tariff-breakdown" style="display:flex;gap:24px;flex-wrap:wrap;font-size:13px"></div></div>
+<div class="grid-main">
+<div class="panel">
+<div class="panel-title">LangGraph 编排图 <span style="color:var(--fg3);font-weight:400">悬浮节点/线查看含义</span></div>
+<div id="graph-container"></div>
+</div>
+<div class="panel">
+<div class="panel-title">全流程步骤</div>
+<div class="steps" id="steps-list"></div>
+</div>
+</div>
+<div class="approval-box" id="approval-box"></div>
+<div class="rt-bar">
+<label>电碳数据日期</label>
+<input type="date" id="rt-date">
+<button class="rt-btn" id="rt-btn" onclick="loadRealtime()">加载实时电碳</button>
+<span class="rt-status" id="rt-status">使用 case 默认数据</span>
+<span class="rt-badge" id="rt-badge" style="display:none"></span>
+</div>
+<div class="chart-row">
+<div class="chart-box"><h3><span style="color:var(--energy)">●</span> 电价与负荷曲线</h3><div class="desc">96 点分时电价 (元/kWh) 与园区总负荷 (MW)</div><canvas id="c-price"></canvas><div class="legend" id="lg-price"></div></div>
+<div class="chart-box"><h3><span style="color:var(--node)">●</span> 储能充放电 · SOC · 温度</h3><div class="desc">电池功率 (MW, 正放电负充电) · SOC (%) · 电芯温度</div><canvas id="c-storage"></canvas><div class="legend" id="lg-storage"></div></div>
+</div>
+<div class="chart-row">
+<div class="chart-box"><h3><span style="color:var(--carbon)">●</span> 电碳双因子 C(τ) 与 Cr(τ)</h3><div class="desc">直接排放因子 (kgCO₂/kWh) 与江亿动态责任因子</div><canvas id="c-carbon"></canvas><div class="legend" id="lg-carbon"></div></div>
+<div class="chart-box"><h3><span style="color:var(--human)">●</span> 净负荷对比 (基线 vs 优化)</h3><div class="desc">储能调峰前后园区从电网取用的功率 (MW)</div><canvas id="c-grid"></canvas><div class="legend" id="lg-grid"></div></div>
+</div>
+<div class="note" id="insight-note"></div>
+<footer>
+<span class="mono">energy_agent_v2 · LangGraph 1.2.9 · PuLP/CBC · Python 3.14</span>
+<span class="mono" id="footer-case"></span>
+</footer>
+</div>
+<div class="tooltip" id="tooltip"></div>
+<script>
+const DATA=__DATA__;
+let currentCase='case1';
+var RT={loaded:false,price:[],c_factor:[],cr_factor:[],date:'',source:''};
+function D(){return DATA[currentCase]}
+const NODES=[
+{id:'initialize_run',x:340,y:36,w:150,h:34,type:'system',label:'初始化运行'},
+{id:'load_inputs',x:340,y:96,w:150,h:34,type:'system',label:'加载日前数据'},
+{id:'compute_tariff',x:340,y:156,w:150,h:34,type:'workflow',label:'电费核算'},
+{id:'optimize_storage',x:340,y:216,w:150,h:34,type:'agent',label:'MILP 储能优化'},
+{id:'compute_carbon',x:340,y:276,w:150,h:34,type:'workflow',label:'电碳双因子计量'},
+{id:'factory_summary',x:340,y:336,w:150,h:34,type:'workflow',label:'审批摘要'},
+{id:'human_approval',x:340,y:396,w:150,h:38,type:'human',label:'人工审批'},
+{id:'freeze_plan',x:150,y:396,w:130,h:34,type:'system',label:'冻结方案'},
+{id:'close_rejected',x:550,y:436,w:130,h:34,type:'system',label:'关闭拒绝'},
+{id:'apply_revision',x:560,y:336,w:130,h:34,type:'workflow',label:'合并修改'},
+{id:'parse_revision',x:560,y:296,w:130,h:34,type:'agent',label:'LLM 修改解析'},
+{id:'fail_run',x:100,y:156,w:120,h:34,type:'system',label:'失败关闭'},
+];
+const NODE_INFO={
+initialize_run:{t:'system',d:'创建运行上下文，锁定调度目标，初始化版本号和方案ID。'},
+load_inputs:{t:'system',d:'加载96点日前数据（负荷、电价、发电结构、储能参数），Pydantic契约校验时间一致性。'},
+compute_tariff:{t:'workflow',d:'黄花真实月度4档到户电价(尖/峰/谷/平)+月度需量电费+政府基金+力调，日电度与月度需量分离核算。'},
+optimize_storage:{t:'agent',d:'PuLP+CBC求解LP。变量：充放电功率/SOC/温度。约束：SOC范围、爬坡率、热安全、末端SOC。输出最优充放电计划。'},
+compute_carbon:{t:'workflow',d:'直接因子C(τ)=发电结构加权平均排放强度；江亿责任因子Cr(τ)=C×(1+λ(C-C̄)/C̄)。评估储能碳减排。'},
+factory_summary:{t:'workflow',d:'汇总收益、风险、检查项，生成工程师审批所需的决策摘要。'},
+human_approval:{t:'human',d:'LangGraph interrupt，暂停等待工程师决策。approve批准/reject拒绝/revise修改后重新优化。'},
+parse_revision:{t:'agent',d:'GLM-5解析工程师自然语言修改意见为结构化DispatchRevision。三层校验(Pydantic+语义+置信度)，2轮澄清+结构化表单回退，采集蒸馏数据。'},
+apply_revision:{t:'workflow',d:'合并审批修改。安全规则：约束只收紧不放松（备用SOC只提高，放电上限只降低）。版本递增。'},
+freeze_plan:{t:'system',d:'方案批准后冻结，进入shadow mode待执行，不直接下发控制指令。'},
+close_rejected:{t:'system',d:'工程师拒绝，运行结束，记录原因。'},
+fail_run:{t:'system',d:'任一节点出错时进入，记录错误并关闭。'},
+};
+const TYPE_COLOR={system:'#3dd9c4',workflow:'#3dd9c4',agent:'#f0a830',human:'#e8835f'};
+const EDGES=[
+{f:'initialize_run',t:'load_inputs',l:''},
+{f:'load_inputs',t:'compute_tariff',l:'ok'},{f:'load_inputs',t:'fail_run',l:'failed',dash:1},
+{f:'compute_tariff',t:'optimize_storage',l:'ok'},{f:'compute_tariff',t:'fail_run',l:'failed',dash:1},
+{f:'optimize_storage',t:'compute_carbon',l:'ok'},{f:'optimize_storage',t:'fail_run',l:'failed',dash:1},
+{f:'compute_carbon',t:'factory_summary',l:'ok'},{f:'compute_carbon',t:'fail_run',l:'failed',dash:1},
+{f:'factory_summary',t:'human_approval',l:'ok'},{f:'factory_summary',t:'fail_run',l:'failed',dash:1},
+{f:'human_approval',t:'freeze_plan',l:'approve'},{f:'human_approval',t:'close_rejected',l:'reject'},
+{f:'human_approval',t:'apply_revision',l:'revise'},
+{f:'human_approval',t:'parse_revision',l:'revise+LLM'},{f:'parse_revision',t:'apply_revision',l:''},
+{f:'apply_revision',t:'optimize_storage',l:'重新优化',curve:1},
+];
+const EDGE_INFO={'ok':'校验通过，继续下一步','failed':'校验失败，进入错误处理','approve':'工程师批准方案','reject':'工程师拒绝方案','revise':'要求修改约束后重新优化','revise+LLM':'工程师要求修改，先经 GLM-5 解析自然语言为结构化 DispatchRevision','重新优化':'合并修改后回到优化节点'};
+
+function renderGraph(){
+const isC2=currentCase==='case2';
+const isC3=currentCase==='case3';
+const c1Path=['initialize_run','load_inputs','compute_tariff','optimize_storage','compute_carbon','factory_summary','human_approval','freeze_plan'];
+const c2Path=['initialize_run','load_inputs','compute_tariff','optimize_storage','compute_carbon','factory_summary','human_approval','apply_revision','optimize_storage','compute_carbon','factory_summary','human_approval','freeze_plan'];
+const c3Path=['initialize_run','load_inputs','compute_tariff','optimize_storage','compute_carbon','factory_summary','human_approval','parse_revision','apply_revision','optimize_storage','compute_carbon','factory_summary','human_approval','freeze_plan'];
+const activePath=isC3?c3Path:isC2?c2Path:c1Path;
+let svg='<svg id="graph-svg" viewBox="0 0 700 500" xmlns="http://www.w3.org/2000/svg">';
+const nm={};NODES.forEach(n=>nm[n.id]=n);
+EDGES.forEach(e=>{
+const a=nm[e.f],b=nm[e.t];
+let x1=a.x+a.w/2,y1=a.y+a.h,x2=b.x+b.w/2,y2=b.y;
+let mx=(x1+x2)/2;
+if(e.curve){x1=a.x+a.w;y1=a.y+a.h/2;x2=b.x+b.w/2;y2=b.y;mx=x1+40}
+let path=`M${x1},${y1} Q${mx},${(y1+y2)/2} ${x2},${y2}`;
+let active=false;for(let _i=0;_i<activePath.length-1;_i++){if(activePath[_i]===e.f&&activePath[_i+1]===e.t){active=true;break}}
+const col=active?'#3dd9c4':'#2d3a33';
+svg+=`<path class="edge-line" d="${path}" fill="none" stroke="${col}" stroke-width="${active?2:1}" stroke-dasharray="${e.dash?'4,3':''}" data-f="${e.f}" data-t="${e.t}" data-l="${e.l}" onmouseenter="edgeHover(event)" onmouseleave="hideTip()"/>`;
+if(e.l){svg+=`<text class="edge-label" x="${mx+4}" y="${(y1+y2)/2+3}" fill="${active?'#7a8a80':'#506058'}">${e.l}</text>`}
+});
+NODES.forEach(n=>{
+const active=activePath.includes(n.id);
+const fill=active?TYPE_COLOR[n.type]:'#1d2722';
+const stroke=active?TYPE_COLOR[n.type]:'#28332d';
+const textCol=active?'#0e1410':'#7a8a80';
+svg+=`<g class="node-grp">`;
+svg+=`<rect class="node-rect" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="4" fill="${fill}" stroke="${stroke}" stroke-width="${active?1.5:1}" data-id="${n.id}" onmouseenter="nodeHover(event,'${n.id}')" onmouseleave="hideTip()" onclick="stepClick('${n.id}')"/>`;
+svg+=`<text x="${n.x+n.w/2}" y="${n.y+n.h/2+4}" text-anchor="middle" font-size="11" font-family="system-ui,-apple-system,'Segoe UI'" fill="${textCol}" pointer-events="none" font-weight="${active?500:400}">${n.label}</text>`;
+svg+=`</g>`;
+});
+svg+='</svg>';
+document.getElementById('graph-container').innerHTML=svg;
+}
+function nodeHover(ev,id){
+const n=NODE_INFO[id];if(!n)return;
+const tip=document.getElementById('tooltip');
+tip.innerHTML=`<span class="tt-type">${TYPE_COLOR[n.t]==='#f0a830'?'Agent 节点':n.t==='human'?'人工节点':'系统/工作流节点'}</span><strong>${NODES.find(x=>x.id===id).label}</strong>${n.d}`;
+showTip(ev,tip);
+}
+function edgeHover(ev){
+const t=ev.target;const l=t.getAttribute('data-l');
+const f=NODES.find(x=>x.id===t.getAttribute('data-f')).label;
+const tg=NODES.find(x=>x.id===t.getAttribute('data-t')).label;
+const tip=document.getElementById('tooltip');
+tip.innerHTML=`<span class="tt-type">条件边</span><strong>${f} → ${tg}</strong>${EDGE_INFO[l]||l}`;
+showTip(ev,tip);
+}
+function showTip(ev,tip){tip.style.display='block';const r=ev.target.getBoundingClientRect();tip.style.left=Math.min(r.left,window.innerWidth-340)+'px';tip.style.top=(r.bottom+8)+'px'}
+function hideTip(){document.getElementById('tooltip').style.display='none'}
+function stepClick(id){
+document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
+const el=document.querySelector(`[data-step="${id}"]`);if(el)el.classList.add('active');
+}
+function renderKPIs(){
+const d=D();const c=document.getElementById('kpis');
+const sv=d.saving;const dr=d.direct_reduction;const rr=d.resp_reduction;
+const k=(label,val,sub,cls)=>`<div class="kpi"><div class="label">${label}</div><div class="val ${cls||''}">${val}</div><div class="sub">${sub}</div></div>`;
+c.innerHTML=[
+k('日电度电费节省',(sv>=0?'+':'')+sv.toFixed(0)+' 元','占日电度'+(sv/d.tariff_energy*100).toFixed(2)+'%',sv>=0?'pos':'neg'),
+k('峰值削减',d.peak_cut.toFixed(0)+' kW',d.peak_cut>1?'基线'+(d.peak_base/1000).toFixed(1)+'MW':'5MW储能对120MW负荷无削峰效果',d.peak_cut>1?'pos':''),
+k('直接碳减排 C(τ)',(dr>=0?'+':'')+dr.toFixed(0)+' kg',dr>=0?'物理减排':'碳排增加',dr>=0?'carbon':'neg'),
+k('责任碳减排 Cr(τ)',(rr>=0?'+':'')+rr.toFixed(0)+' kg',rr>=0?'激励信号(非物理减排)':'碳排增加',rr>=0?'carbon':'neg'),
+].join('');
+}
+function renderSteps(){
+const d=D();const c=document.getElementById('steps-list');
+c.innerHTML=d.steps.map((s,i)=>{
+const isHuman=s.id.includes('human_approval');
+return `<div class="step" data-step="${s.id}" onclick="stepClick('${s.id}')">
+<div class="step-dot ${isHuman?'human':''}"></div>
+<div class="step-content"><div class="st-title">${i+1}. ${s.title}</div><div class="st-detail">${s.detail}</div></div></div>`;
+}).join('');
+}
+function renderApproval(){
+const d=D();const isC2=currentCase==='case2';
+const isC3=currentCase==='case3';
+const c=document.getElementById('approval-box');
+if(isC2){
+c.innerHTML=`<h3>审批记录 · revise 回路</h3>
+<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+<span class="mono" style="color:var(--fg2);font-size:12px">V1 →</span>
+<span class="decision revise">REVISE</span>
+<span class="mono" style="color:var(--fg2);font-size:11px">收紧备用SOC→0.3</span>
+<span class="mono" style="color:var(--fg3)">→</span>
+<span class="mono" style="color:var(--fg2);font-size:12px">V2 →</span>
+<span class="decision approve">APPROVE</span>
+</div>
+<div style="font-size:12px;color:var(--fg2)">V1 方案经 revise 收紧约束后重新优化为 V2，最终批准。Cr 责任减排比 C 直接减排高 ${(d.resp_reduction-d.direct_reduction).toFixed(0)} kg——这是激励信号的标度放大，非物理减排。Cr 用于优化方向引导，不进碳交易/碳报告。</div>`;
+}else if(isC3){
+c.innerHTML=`<h3>审批记录 · GLM-5 修改解析回路</h3>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+<span class="mono" style="color:var(--fg2);font-size:12px">V1 →</span>
+<span class="decision revise">REVISE</span>
+<span class="mono" style="color:var(--fg3);font-size:10px">"SOC太低改0.3,夜里别放电"</span>
+<span class="mono" style="color:var(--fg3)">→</span>
+<span class="mono" style="color:var(--node);font-size:10px">GLM-5</span>
+<span class="mono" style="color:var(--fg3)">→</span>
+<span class="mono" style="color:var(--fg2);font-size:12px">V2 →</span>
+<span class="decision approve">APPROVE</span>
+</div>
+<div style="font-size:12px;color:var(--fg2)">工程师自然语言经 GLM-5 解析为结构化 DispatchRevision（SOC=0.3, 夜间禁放），经三层校验后重优化 V2 批准。蒸馏配对已采集到 data/distillation/。</div>`;
+}else{
+c.innerHTML=`<h3>审批记录</h3>
+<div style="display:flex;gap:12px;align-items:center">
+<span class="mono" style="color:var(--fg2);font-size:12px">V1 →</span>
+<span class="decision approve">APPROVE</span>
+<span class="mono" style="color:var(--fg2);font-size:11px">方案 V1 直接批准</span>
+</div>`;
+}
+}
+function renderInsight(){
+const d=D();const isC3=currentCase==='case3';const el=document.getElementById('insight-note');
+if(currentCase==='case1'){
+el.innerHTML=`<strong>观察：</strong>min_cost 目标下储能谷充峰放，虽然省了 ${d.saving.toFixed(0)} 元电费，但把负荷从低碳时段（白天光伏）转移到高碳时段（夜间煤电），碳排反而增加 ${Math.abs(d.direct_reduction).toFixed(0)} kg。这正是引入 min_carbon 目标和 Cr 动态责任因子的动机。`;
+}else if(isC3){
+el.innerHTML=`<strong>观察：</strong>Case 3 验证了 GLM-5 LLM 接入回路。工程师说"SOC太低改0.3，夜里别放电"，GLM-5 解析为 reserve_soc_min_ratio=0.3 + blocked_intervals(夜间)。经 1 轮解析直接 resolved，V2 重优化后省 ${d.saving.toFixed(0)} 元电度电费。蒸馏数据已写入 data/distillation/ 供 V3 few-shot 使用。`;
+}else{
+el.innerHTML=`<strong>观察：</strong>切换到 min_carbon 目标后，系统在真实4档电价下既减碳又省钱（省 ${d.saving.toFixed(0)} 元日电度电费）。Cr 责任减排 ${d.resp_reduction.toFixed(0)} kg 是激励信号（非物理减排），用于引导负荷匹配低碳发电时段。`;
+}
+}
+
+var CHART_DATA={};
+function registerChart(id,series,opts){
+CHART_DATA[id]={series:series,opts:opts||{}};
+var cv=document.getElementById(id);
+if(!cv)return;
+cv.addEventListener('mousemove',function(e){
+var cd=CHART_DATA[id];if(!cd)return;
+var rect=cv.getBoundingClientRect();
+var mx=e.clientX-rect.left;
+var n=cd.series[0].data.length;
+var pw=cv.offsetWidth-(cd.opts.dualAxis?42:42)-12;
+var pad_l=42;
+var idx=Math.round((mx-pad_l)/(pw/(n-1)));
+idx=Math.max(0,Math.min(n-1,idx));
+var hour=Math.floor(idx*15/60);
+var min=(idx*15)%60;
+var tip=document.getElementById('tooltip');
+var parts=['<span class="tt-type">'+String(hour).padStart(2,'0')+':'+String(min).padStart(2,'0')+' (idx '+idx+')</span>'];
+cd.series.forEach(function(s){
+var val=s.data[idx];
+var unit=s.unit||(s.axis==='right'?(cd.opts.yLabelRight||''):(cd.opts.yLabel||''));
+var vstr=Math.abs(val)>100?val.toFixed(0):val.toFixed(3);
+var nm=s.name?s.name+' ':'';
+parts.push('<strong style="color:'+s.color+'">'+nm+vstr+'</strong> '+unit);
+});
+tip.innerHTML=parts.join('<br>');
+tip.style.display='block';
+tip.style.left=Math.min(e.clientX+12,window.innerWidth-340)+'px';
+tip.style.top=(e.clientY+12)+'px';
+});
+cv.addEventListener('mouseleave',function(){document.getElementById('tooltip').style.display='none';});
+}
+
+function drawChart(id,series,opts){opts=opts||{};const cv=document.getElementById(id);const ctx=cv.getContext('2d');const dpr=window.devicePixelRatio||1;const w=cv.offsetWidth,h=cv.offsetHeight;cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const pad=opts.dualAxis?{l:42,r:42,t:8,b:22}:{l:42,r:12,t:8,b:22};const pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;const n=series[0].data.length;const x=i=>pad.l+(i/(n-1))*pw;function range(arr,fz){let mn=Math.min(...arr),mx=Math.max(...arr);if(fz!==false&&mn>0)mn=0;if(mx<0)mx=1;const r=mx-mn||1;mn-=r*0.08;mx+=r*0.08;return[mn,mx];}const leftSeries=opts.dualAxis?series.filter(s=>s.axis!=='right'):series;const rightSeries=opts.dualAxis?series.filter(s=>s.axis==='right'):[];let _ldata=leftSeries.flatMap(s=>s.data);
+if(opts.thresholds){opts.thresholds.filter(t=>t.axis!=='right').forEach(t=>{_ldata.push(t.value);});}
+const[lmin,lmax]=range(_ldata,opts.forceZero);let _rdata=rightSeries.length?rightSeries.flatMap(s=>s.data):[0,1];
+if(opts.thresholds){opts.thresholds.filter(t=>t.axis==='right').forEach(t=>{_rdata.push(t.value);});}
+const[rmin,rmax]=range(_rdata,opts.forceZero);const yL=v=>pad.t+ph-(v-lmin)/(lmax-lmin)*ph;const yR=v=>pad.t+ph-(v-rmin)/(rmax-rmin)*ph;ctx.strokeStyle='#1d2722';ctx.lineWidth=1;for(let i=0;i<=4;i++){const yy=pad.t+ph*i/4;ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();}ctx.fillStyle='#506058';ctx.font='9px Consolas,monospace';for(let i=0;i<=4;i++){const yy=pad.t+ph*i/4;const v=lmax-(lmax-lmin)*i/4;ctx.fillText(v.toFixed(Math.abs(v)>100?0:2),4,yy+3);}if(opts.yLabel){ctx.save();ctx.translate(10,pad.t+ph/2);ctx.rotate(-Math.PI/2);ctx.fillStyle='#7a8a80';ctx.font='9px Consolas,monospace';ctx.textAlign='center';ctx.fillText(opts.yLabel,0,0);ctx.restore();}if(opts.dualAxis){ctx.fillStyle='#7a8a80';for(let i=0;i<=4;i++){const yy=pad.t+ph*i/4;const v=rmax-(rmax-rmin)*i/4;ctx.fillText(v.toFixed(0),w-pad.r+4,yy+3);}if(opts.yLabelRight){ctx.save();ctx.translate(w-4,pad.t+ph/2);ctx.rotate(Math.PI/2);ctx.fillStyle='#7a8a80';ctx.font='9px Consolas,monospace';ctx.textAlign='center';ctx.fillText(opts.yLabelRight,0,0);ctx.restore();}}for(let h2=0;h2<=24;h2+=6){const i=h2*4;const xx=x(i);ctx.fillText(h2+':00',xx-8,h-6);}series.forEach(s=>{const yf=(opts.dualAxis&&s.axis==='right')?yR:yL;const base=(opts.dualAxis&&s.axis==='right')?rmin:lmin;ctx.strokeStyle=s.color;ctx.lineWidth=1.8;ctx.beginPath();s.data.forEach((v,i)=>{if(i===0)ctx.moveTo(x(i),yf(v));else ctx.lineTo(x(i),yf(v));});ctx.stroke();if(s.fill){ctx.lineTo(x(n-1),yf(base));ctx.lineTo(x(0),yf(base));ctx.closePath();ctx.fillStyle=s.fill;ctx.fill();}});
+if(opts.thresholds){opts.thresholds.forEach(th=>{const yf2=th.axis==='right'?yR:yL;ctx.strokeStyle=th.color;ctx.lineWidth=1;ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(pad.l,yf2(th.value));ctx.lineTo(w-pad.r,yf2(th.value));ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=th.color;ctx.font='9px Consolas,monospace';ctx.fillText(th.label,w-pad.r-40,yf2(th.value)-3);});}}function renderCharts(){
+const d=D();
+const _price=RT.loaded?RT.price:d.price;
+const _C=RT.loaded?RT.c_factor:d.C_factor;
+const _Cr=RT.loaded?RT.cr_factor:d.Cr_factor;
+drawChart('c-price',[
+{data:_price.map(v=>v),color:'#f0a830'},
+{data:d.load.map(v=>v/1000),color:'#7ab87a',fill:'rgba(122,184,122,.08)',axis:'right'},
+],{dualAxis:true,yLabel:'元/kWh',yLabelRight:'MW'});
+registerChart('c-price',[{data:_price,color:'#f0a830',name:'电价',unit:'元/kWh'},{data:d.load.map(v=>v/1000),color:'#7ab87a',axis:'right',name:'负荷',unit:'MW'}],{dualAxis:true,yLabel:'元/kWh',yLabelRight:'MW'});
+document.getElementById('lg-price').innerHTML='<span><i style="background:#f0a830"></i>电价(左轴 元/kWh)</span><span><i style="background:#7ab87a"></i>负荷(右轴 MW)</span>';
+drawChart('c-storage',[
+{data:d.battery_power.map(v=>v/1000),color:'#f0a830'},
+{data:d.temp.map(v=>v),color:'#e8835f'},
+{data:d.soc.map(v=>v*100),color:'#3dd9c4',axis:'right'},
+],{dualAxis:true,forceZero:false,thresholds:[{value:45,color:'#e85f5f',label:'45C安全线',axis:'left'}],yLabel:'MW/°C',yLabelRight:'%'});
+registerChart('c-storage',[{data:d.battery_power.map(v=>v/1000),color:'#f0a830',name:'功率',unit:'MW'},{data:d.temp,color:'#e8835f',name:'温度',unit:'°C'},{data:d.soc.map(v=>v*100),color:'#3dd9c4',axis:'right',name:'SOC',unit:'%'}],{dualAxis:true,forceZero:false,yLabel:'MW/°C',yLabelRight:'%'});
+document.getElementById('lg-storage').innerHTML='<span><i style="background:#f0a830"></i>功率MW(左轴)</span><span><i style="background:#e8835f"></i>温度°C(左轴)</span><span><i style="background:#3dd9c4"></i>SOC%(右轴)</span>';
+drawChart('c-carbon',[
+{data:_Cr,color:'#7ab87a'},
+{data:_C,color:'#3dd9c4'},
+],{forceZero:false,yLabel:'kgCO₂/kWh'});
+registerChart('c-carbon',[{data:_Cr,color:'#7ab87a',name:'Cr',unit:'kgCO₂/kWh'},{data:_C,color:'#3dd9c4',name:'C',unit:'kgCO₂/kWh'}],{forceZero:false,yLabel:'kgCO₂/kWh'});
+document.getElementById('lg-carbon').innerHTML='<span><i style="background:#7ab87a"></i>Cr(τ) 责任因子</span><span><i style="background:#3dd9c4"></i>C(τ) 直接因子</span>';
+drawChart('c-grid',[
+{data:d.grid_base.map(v=>v/1000),color:'#506058'},
+{data:d.grid_opt.map(v=>v/1000),color:'#3dd9c4'},
+]);
+registerChart('c-grid',[{data:d.grid_base.map(v=>v/1000),color:'#506058',name:'基线',unit:'MW'},{data:d.grid_opt.map(v=>v/1000),color:'#3dd9c4',name:'优化后',unit:'MW'}],{});
+document.getElementById('lg-grid').innerHTML='<span><i style="background:#506058"></i>基线</span><span><i style="background:#3dd9c4"></i>优化后</span>';
+}
+function switchCase(c){
+currentCase=c;
+document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+event.target.classList.add('active');
+document.getElementById('footer-case').textContent=c+' · '+D().objective;
+renderAll();
+}
+
+function renderTariff(){
+const d=D();const c=document.getElementById('tariff-breakdown');
+const e=d.tariff_energy||0,dm=d.tariff_demand||0,gf=d.tariff_gov_fund||0,ra=d.tariff_reactive||0;
+const sv=d.saving||0;
+const item=(label,val,note,col)=>`<div><span style="color:var(--fg2);font-size:11px">${label}</span><br><span class="mono" style="font-size:18px;color:${col||'var(--fg)'}">${val}</span> <span style="color:var(--fg3);font-size:11px">${note}</span></div>`;
+c.innerHTML=[
+item('日电度电费',e.toFixed(0)+' 元','(日,可优化)','var(--energy)'),
+item('需量电费',dm.toFixed(0)+' 元','(月,固定)',sv>1?'var(--fg2)':'var(--fg2)'),
+item('政府基金',(gf||0).toFixed(0)+' 元','(月,固定)','var(--fg2)'),
+item('力调',(ra||0).toFixed(0)+' 元','(月,奖励)','var(--carbon)'),
+item('节省率',(sv/(e||1)*100).toFixed(2)+'%','vs 日电度','var(--node)'),
+].join('');
+}
+
+function renderAll(){
+try{renderKPIs()}catch(e){console.error('KPI',e)}try{renderTariff()}catch(e){console.error('tariff',e)}try{renderGraph()}catch(e){console.error('graph',e)}try{renderSteps()}catch(e){console.error('steps',e)}try{renderApproval()}catch(e){console.error('approval',e)}try{renderInsight()}catch(e){console.error('insight',e)}try{renderCharts()}catch(e){console.error('charts',e)}
+}
+document.getElementById('footer-case').textContent='case1 · '+D().objective;
+renderAll();
+async function loadRealtime(){
+const dp=document.getElementById('rt-date'),btn=document.getElementById('rt-btn'),st=document.getElementById('rt-status'),badge=document.getElementById('rt-badge');
+if(!dp.value){st.textContent='请选择日期';return;}
+btn.disabled=true;st.textContent='加载中...';
+try{
+const res=await fetch('/api/v1/grid-factors?date='+dp.value);
+if(!res.ok){const e=await res.json();st.textContent='错误: '+(e.detail||res.status);return;}
+const r=await res.json();
+RT.loaded=true;RT.price=r.price;RT.c_factor=r.c_factor;RT.cr_factor=r.cr_factor;RT.date=r.actual_date;
+badge.textContent='实时 '+r.actual_date;badge.style.display='inline-block';
+st.textContent='电价均值 '+r.summary.price.mean.toFixed(4)+' 元/kWh · C(τ)均值 '+r.summary.c_factor.mean.toFixed(4)+' kgCO₂/kWh';
+renderCharts();
+}catch(e){st.textContent='请求失败: '+e.message;}
+btn.disabled=false;
+}
+async function initRealtime(){
+try{
+const res=await fetch('/api/v1/data-range');
+const r=await res.json();
+if(r.generation){const dp=document.getElementById('rt-date');dp.min=r.generation.start;dp.max=r.generation.end;dp.value=r.generation.start;loadRealtime();}
+}catch(e){document.getElementById('rt-status').textContent='数据服务未连接，使用 case 默认数据';}
+}
+initRealtime();
+</script>
+</body>
+</html>

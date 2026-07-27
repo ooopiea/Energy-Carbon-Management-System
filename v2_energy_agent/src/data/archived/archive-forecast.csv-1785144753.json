@@ -1,0 +1,37 @@
+{
+  "provenance": {
+    "source_file": {
+      "file_name": "forecast.csv",
+      "file_path": "/tmp/forecast.csv",
+      "file_format": "csv",
+      "uploaded_by": "eng",
+      "uploaded_at": "2026-07-27T09:32:33.782976Z",
+      "raw_content_preview": "time,load\n00:00,500",
+      "file_size_bytes": 512
+    },
+    "data_version": "archive-forecast.csv-1785144753",
+    "provenance_description": "ok",
+    "transformations_applied": [],
+    "compliance_tags": [
+      "auto-derived"
+    ],
+    "retention_recommendation": "1-year",
+    "archived_path": "",
+    "archived_at": null
+  },
+  "data": {
+    "file_type": "load_forecast",
+    "site_id": "site-001",
+    "target_date": "2026-07-27",
+    "time_granularity_minutes": 15,
+    "field_mappings": [
+      {
+        "raw_column": "load",
+        "standard_field": "load_kw",
+        "confidence": 0.9
+      }
+    ],
+    "quality_issues": [],
+    "overall_confidence": 0.9
+  }
+}

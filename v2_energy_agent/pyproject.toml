@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "energy-agent-v2"
+version = "2.0.0"
+description = "蓝思园区能源管理 Agent V2：LangGraph 编排 + MILP 储能 + 江亿电碳双因子"
+requires-python = ">=3.11"
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "fastapi>=0.116,<1",
+  "langgraph==1.2.9",
+  "langgraph-checkpoint-sqlite==3.1.0",
+  "numpy>=1.26,<3",
+  "openai>=1.100,<3",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "pulp>=2.8,<4",
+  "python-dotenv>=1.1,<2",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/energy_agent_v2"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

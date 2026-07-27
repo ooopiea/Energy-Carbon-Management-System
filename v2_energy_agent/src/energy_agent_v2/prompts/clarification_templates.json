@@ -1,0 +1,7 @@
+{
+  "terminal_soc_min_ratio": "你提到的末端SOC目标值是多少？请给出一个 0 到 1 之间的数字（如 0.5 表示 50%）。",
+  "reserve_soc_min_ratio": "你希望全程SOC不低于多少？请给出一个 0 到 1 之间的数字（如 0.3 表示 30%）。",
+  "max_discharge_power_kw": "你希望将最大放电功率限制在多少 kW？（当前上限 {current_max} kW）",
+  "blocked_intervals": "你说的禁止充放电时段，具体指哪个时间段？请按 HH:MM-HH:MM 格式给出（如 23:00-07:00）。",
+  "objective": "你希望切换到哪个优化目标？可选：min_cost（最低成本）、min_carbon（最低碳排放）、limit_peak_demand（限制峰值需量）。"
+}
