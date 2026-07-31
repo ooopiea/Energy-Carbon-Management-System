@@ -28,7 +28,8 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timedelta
+import re
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from energy_agent_v2.contracts import GenerationMixPoint
@@ -45,6 +46,10 @@ _GEN_FILES: dict[str, str] = {
 _TOTAL_FILE = "实时总发电出力.csv"
 _PRICE_DIR = "hubei_rt_clearing"
 _PRICE_FILE = "实时出清价格.csv"
+
+# 每日真实负荷目录（变电站按日 CSV，每天一个文件）
+# 文件名格式: 变电站实时负荷-{月}月_{月.日}.csv（例: 变电站实时负荷-6月_6.15.csv）
+_LOAD_DIR = "daily_load_real/different_substation"
 
 # 各能源出力修正系数（真实年发电量比例 / 原始数据比例）
 # 真实比例: 火60.6% 水21.2% 风13.3% 光4.8%（来源：湖南2025实际发电量）
@@ -76,6 +81,11 @@ class CSVDataFetcher:
         self.hunan_dir = self.data_dir / "hunan_core"
         self.price_path = self.data_dir / _PRICE_DIR / _PRICE_FILE
         self._cache: dict[str, dict[datetime, float]] = {}
+        self.last_generation_date: datetime | None = None
+        self.last_price_date: datetime | None = None
+        self.last_load_date: datetime | None = None
+        self.data_coverage: dict[str, str] = {}
+        self._load_index: dict[date, Path] | None = None
 
     # ------------------------------------------------------------- CSV 读取
     def _load_csv(self, path: Path) -> dict[datetime, float]:
@@ -151,6 +161,7 @@ class CSVDataFetcher:
         if day_start is None:
             return []
 
+        self.last_generation_date = day_start
         total_grid = self._day_grid(total_data, day_start)
         source_grids = {
             name: {ts: val for ts, val in self._day_grid(data, day_start)}
@@ -181,4 +192,149 @@ class CSVDataFetcher:
         day_start = self._nearest_day(start, set(price_data.keys()))
         if day_start is None:
             return []
+        self.last_price_date = day_start
         return [val for _, val in self._day_grid(price_data, day_start)]
+
+    def get_data_provenance(self, target_date) -> dict:
+        """Return actual data dates used vs requested, plus coverage range."""
+        target_str = target_date.isoformat() if hasattr(target_date, 'isoformat') else str(target_date)
+        gen_str = self.last_generation_date.date().isoformat() if self.last_generation_date else None
+        price_str = self.last_price_date.date().isoformat() if self.last_price_date else None
+        load_str = self.last_load_date.date().isoformat() if self.last_load_date else None
+        result = {
+            "target_date": target_str,
+            "generation_data_date": gen_str,
+            "generation_data_exact_match": gen_str == target_str if gen_str else False,
+            "price_data_date": price_str,
+            "price_data_exact_match": price_str == target_str if price_str else False,
+            "load_data_date": load_str,
+            "load_data_exact_match": load_str == target_str if load_str else False,
+        }
+        # Coverage range
+        try:
+            total = self._load_csv(self.hunan_dir / _TOTAL_FILE)
+            if total:
+                gen_dates = sorted({ts.date().isoformat() for ts in total})
+                result["generation_coverage"] = {"start": gen_dates[0], "end": gen_dates[-1], "days": len(gen_dates)}
+        except Exception:
+            pass
+        try:
+            price_data = self._load_csv(self.price_path)
+            if price_data:
+                price_dates = sorted({ts.date().isoformat() for ts in price_data})
+                result["price_coverage"] = {"start": price_dates[0], "end": price_dates[-1], "days": len(price_dates)}
+        except Exception:
+            pass
+        try:
+            load_idx = self._build_load_index()
+            if load_idx:
+                load_dates = sorted(d.isoformat() for d in load_idx)
+                result["load_coverage"] = {"start": load_dates[0], "end": load_dates[-1], "days": len(load_dates)}
+        except Exception:
+            pass
+        return result
+
+    # ------------------------------------------------------------- 真实负荷
+    def _build_load_index(self) -> dict[date, Path]:
+        """扫描日负荷目录，从 CSV header 日期构建索引（惰性缓存）。"""
+        if self._load_index is not None:
+            return self._load_index
+        load_dir = self.data_dir / _LOAD_DIR
+        index: dict[date, Path] = {}
+        if not load_dir.exists():
+            self._load_index = index
+            return index
+        for f in load_dir.glob("*.csv"):
+            try:
+                with f.open(encoding="utf-8-sig") as fh:
+                    fh.readline()  # 跳过标题行
+                    header_line = fh.readline()  # 含日期的表头行
+                    fields = header_line.split(",")
+                    if len(fields) > 2:
+                        date_str = fields[2].strip()  # 如 "2026.4.12"
+                        parts = date_str.replace("/", ".").split(".")
+                        if len(parts) >= 3:
+                            y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+                            index[date(y, m, d)] = f
+            except (ValueError, OSError, IndexError, StopIteration):
+                continue
+        self._load_index = index
+        return index
+
+    def fetch_real_load(self, target: datetime) -> list[float] | None:
+        """读取真实日负荷 CSV，返回插值后的 96 点负荷（kW）；无数据时返回 None。"""
+        index = self._build_load_index()
+        if not index:
+            return None
+        target_d = target.date()
+        if target_d in index:
+            file_path = index[target_d]
+            self.last_load_date = datetime.combine(target_d, datetime.min.time())
+        else:
+            nearest = min(index.keys(), key=lambda d: abs((d - target_d).days))
+            file_path = index[nearest]
+            self.last_load_date = datetime.combine(nearest, datetime.min.time())
+        return self._parse_load_file(file_path)
+
+    @staticmethod
+    def _parse_load_file(path: Path) -> list[float] | None:
+        """解析日负荷 CSV（进线求和 + 线性插值到 96 点），返回 kW 列表。"""
+        try:
+            with path.open(encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+        except (FileNotFoundError, OSError):
+            return None
+        if len(rows) < 3:
+            return None
+        header = rows[1]
+        time_cols: list[tuple[int, float]] = []
+        for j, v in enumerate(header):
+            v = v.strip()
+            if ":" not in v or j < 3:
+                continue
+            t = v.split(" ")[-1]
+            try:
+                parts = t.split(":")
+                hour = int(parts[0]) + int(parts[1]) / 60.0 + int(parts[2]) / 3600.0
+                time_cols.append((j, hour))
+            except (ValueError, IndexError):
+                continue
+        if not time_cols:
+            return None
+        # 对每个时间点，求进线（开群线）负荷总和（万KW -> kW）
+        raw: list[tuple[float, float]] = []
+        for j, hour in time_cols:
+            total_kw = 0.0
+            for row in rows[2:]:
+                if len(row) <= j or len(row) < 3:
+                    continue
+                name = row[1].strip()
+                unit = row[2].strip()
+                if "万" in unit and ("线" in name or "群" in name):
+                    try:
+                        total_kw += float(row[j]) * 10000.0
+                    except (ValueError, IndexError):
+                        pass
+            raw.append((hour, total_kw))
+        if not raw or all(kw <= 0 for _, kw in raw):
+            return None
+        raw.sort(key=lambda p: p[0])
+        raw_hours = [p[0] for p in raw]
+        raw_kw = [p[1] for p in raw]
+        # 线性插值到 96 点（15 分钟粒度）
+        result: list[float] = []
+        for i in range(_POINTS_PER_DAY):
+            t = i * _STEP_MINUTES / 60.0
+            if t <= raw_hours[0]:
+                result.append(raw_kw[0])
+            elif t >= raw_hours[-1]:
+                result.append(raw_kw[-1])
+            else:
+                for k in range(len(raw_hours) - 1):
+                    if raw_hours[k] <= t <= raw_hours[k + 1]:
+                        frac = (t - raw_hours[k]) / (raw_hours[k + 1] - raw_hours[k])
+                        result.append(raw_kw[k] * (1 - frac) + raw_kw[k + 1] * frac)
+                        break
+                else:
+                    result.append(raw_kw[-1])
+        return result

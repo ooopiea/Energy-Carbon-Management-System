@@ -73,6 +73,14 @@ class MILPStorageOptimizer:
         if revision and revision.max_discharge_power_kw is not None:
             eff_max_discharge = min(eff_max_discharge, revision.max_discharge_power_kw)
 
+        eff_max_charge = battery.max_charge_power_kw
+        if revision and revision.max_charge_power_kw is not None:
+            eff_max_charge = min(eff_max_charge, revision.max_charge_power_kw)
+
+        eff_max_temp = battery.max_cell_temperature_c
+        if revision and revision.max_cell_temperature_c is not None:
+            eff_max_temp = min(eff_max_temp, revision.max_cell_temperature_c)
+
         # 每天清零：末端 SOC 必须回到物理最低值（eff_min_soc）
         # revision 可提高末端目标（如工程师要求保留更多备用电量）
         terminal_target = max(
@@ -96,13 +104,16 @@ class MILPStorageOptimizer:
         t_amb = battery.ambient_temperature_c
         r_th = battery.thermal_resistance_c_per_kw
 
-        carbon_factors = self._resolve_carbon_factors(inputs, n)
+        if request.carbon_factors_override is not None and len(request.carbon_factors_override) == n:
+            carbon_factors = list(request.carbon_factors_override)
+        else:
+            carbon_factors = self._resolve_carbon_factors(inputs, n)
 
         # ---- build LP ----
         prob = pulp.LpProblem("storage_dispatch", pulp.LpMinimize)
 
         p_ch = [
-            pulp.LpVariable(f"pch_{t}", lowBound=0, upBound=battery.max_charge_power_kw)
+            pulp.LpVariable(f"pch_{t}", lowBound=0, upBound=eff_max_charge)
             for t in range(n)
         ]
         p_dis = [
@@ -114,7 +125,7 @@ class MILPStorageOptimizer:
             for t in range(n)
         ]
         temp = [
-            pulp.LpVariable(f"temp_{t}", lowBound=0, upBound=battery.max_cell_temperature_c)
+            pulp.LpVariable(f"temp_{t}", lowBound=0, upBound=eff_max_temp)
             for t in range(n)
         ]
         peak = pulp.LpVariable("peak", lowBound=0)
@@ -247,6 +258,8 @@ class MILPStorageOptimizer:
             terminal_target=terminal_target,
             max_charge=battery.max_charge_power_kw,
             eff_max_discharge=eff_max_discharge,
+            eff_max_charge=eff_max_charge,
+            eff_max_temp=eff_max_temp,
             max_ramp=battery.max_ramp_kw_per_step,
             max_temp=battery.max_cell_temperature_c,
         )
@@ -331,6 +344,8 @@ class MILPStorageOptimizer:
         terminal_target: float,
         max_charge: float,
         eff_max_discharge: float,
+        eff_max_charge: float,
+        eff_max_temp: float,
         max_ramp: float,
         max_temp: float,
     ) -> ConstraintCheckResult:
@@ -371,11 +386,11 @@ class MILPStorageOptimizer:
                     severity="critical",
                     message=(
                         f"Charge power {p_ch[t]:.2f} kW exceeds limit "
-                        f"{max_charge:.2f} kW at step {t}"
+                        f"{eff_max_charge:.2f} kW at step {t}"
                     ),
                     point_index=t,
                     actual_value=p_ch[t],
-                    limit_value=max_charge,
+                    limit_value=eff_max_charge,
                     unit="kW",
                 ))
             if p_dis[t] > eff_max_discharge + _TOL:
@@ -410,11 +425,11 @@ class MILPStorageOptimizer:
                     severity="critical",
                     message=(
                         f"Cell temperature {temp[t]:.2f} C exceeds limit "
-                        f"{max_temp:.2f} C at step {t}"
+                        f"{eff_max_temp:.2f} C at step {t}"
                     ),
                     point_index=t,
                     actual_value=temp[t],
-                    limit_value=max_temp,
+                    limit_value=eff_max_temp,
                     unit="celsius",
                 ))
 

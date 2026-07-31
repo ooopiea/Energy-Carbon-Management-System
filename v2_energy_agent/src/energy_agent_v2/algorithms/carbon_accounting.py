@@ -101,7 +101,7 @@ class CarbonAccountant:
             direct_factor_c_kg_per_kwh=c_factors,
             responsibility_factor_cr_kg_per_kwh=cr_factors,
             responsibility_adjustment_ratio=ratios,
-            emission_factor_library_version=_EF_LIBRARY_VERSION,
+            emission_factor_library_version=ef_lib.source_label or _EF_LIBRARY_VERSION,
             region=region,
             notes=notes,
         )

@@ -100,7 +100,25 @@ class RevisionParser:
     @staticmethod
     def _coerce_storage(sr: StorageOptimizationResult | dict[str, Any]) -> StorageOptimizationResult:
         if isinstance(sr, dict):
-            return StorageOptimizationResult.model_validate(sr)
+            try:
+                return StorageOptimizationResult.model_validate(sr)
+            except Exception:
+                return StorageOptimizationResult.model_validate({
+                    "plan_id": "unknown", "plan_version": 0, "site_id": "unknown",
+                    "target_date": "2026-01-01", "start_at": "2026-01-01T00:00",
+                    "time_step_minutes": 15, "point_count": 0, "timestamps": [],
+                    "load_forecast_kw": [], "battery_power_kw": [], "soc_ratio": [],
+                    "cell_temperature_c": [], "baseline_grid_import_power_kw": [],
+                    "grid_import_power_kw": [], "electricity_price_cny_per_kwh": [],
+                    "baseline_energy_cost_cny": 0, "optimized_energy_cost_cny": 0,
+                    "energy_cost_saving_cny": 0, "baseline_peak_demand_kw": 0,
+                    "optimized_peak_demand_kw": 0, "peak_reduction_kw": 0,
+                    "terminal_soc_ratio": 0, "max_cell_temperature_c": 0,
+                    "constraint_check": {"passed": True, "violations": []},
+                    "solver_status": "Unknown", "solve_duration_ms": 0,
+                    "algorithm_version": "unknown", "agent_version": "unknown",
+                    "data_version": "unknown", "objective": "min_cost",
+                })
         return sr
 
     def _build_user_message(
@@ -118,9 +136,11 @@ class RevisionParser:
         parts.append(f"- 最高温度: {sr.max_cell_temperature_c:.1f} C")
         parts.append(f"- 末端SOC: {sr.terminal_soc_ratio:.3f}")
         # 关键摘要值（不传完整序列，减少 token 加速 LLM 响应）
-        parts.append(f"- 最低SOC: {min(sr.soc_ratio):.3f}")
-        parts.append(f"- 最大放电功率: {max((p for p in sr.battery_power_kw if p > 0), default=0):.0f} kW")
-        parts.append(f"- 充放电时段数: {sum(1 for p in sr.battery_power_kw if abs(p) > 1)}")
+        soc_values = sr.soc_ratio or [0]
+        parts.append(f"- 最低SOC: {min(soc_values):.3f}")
+        discharge_values = [p for p in (sr.battery_power_kw or []) if p > 0]
+        parts.append(f"- 最大放电功率: {max(discharge_values, default=0):.0f} kW")
+        parts.append(f"- 充放电时段数: {sum(1 for p in (sr.battery_power_kw or []) if abs(p) > 1)}")
         parts.append("")
         if clarification_history:
             parts.append("## 澄清历史")

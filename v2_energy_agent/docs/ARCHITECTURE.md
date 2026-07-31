@@ -30,18 +30,19 @@ v2_energy_agent/
 │   │   └── tariff.py             # 分时电费计算器
 │   ├── llm/                  # LLM agent 集合（client + 4 个语义理解 agent）
 │   │   ├── client.py             # OpenAI 兼容 client（GLM-5）+ JSON 双层约束
-│   │   ├── json_schemas.py       # 5 个输出 schema 集中定义
+│   │   ├── json_schemas.py       # 6 个输出 schema 集中定义
 │   │   ├── base.py               # BaseLLMAgent 公共基类
 │   │   ├── data_ingest.py        # 数据清洗 agent
 │   │   ├── data_archive.py       # 数据封存 agent
 │   │   ├── anomaly_monitor.py    # 异常工况 agent
 │   │   ├── distillation_review.py# 复盘蒸馏 agent
 │   │   └── parse_revision.py     # 审批修改意图解析 agent
+│       └── storage_approval.py   # 储能审批 Agent（包装 RevisionParser + 物理含义 + 重算决策）
 │   └── prompts/              # 各 agent 的 system prompt
 │   └── data/
 │       ├── provider.py            # 合成种子数据提供者
 │       └── db_fetcher.py          # 湖南 EData 数据库下载（优雅降级）
-├── tests/                    # 46 项单元测试
+├── tests/                    # 51 项单元测试
 ├── cases/
 │   ├── case1_storage_dispatch/    # 案例1：储能经济调度
 │   └── case2_carbon_aware/        # 案例2：电碳感知调度
@@ -60,14 +61,15 @@ v2_energy_agent/
 | 节点 | 类型 | 职责 |
 |---|---|---|
 | `ingest_raw_data` | llm | 数据清洗：原始文件 → LLM 判类型 + 字段映射 + 质量检测（无 raw_file 时跳过） |
-| `archive_data` | llm | 数据封存：清洗结果 → 血缘记录 + 落盘（无 ingest_result 时跳过） |
+| `archive_data` | llm | 数据封存：在 freeze_plan 之后执行，清洗结果 → 血缘记录 + 落盘（无 ingest_result 时跳过） |
 | `initialize_run` | system | 初始化运行上下文和版本 |
 | `load_inputs` | system | 加载日前数据（负荷/电价/发电结构/储能参数） |
 | `compute_tariff` | workflow | 计算基线电费（分时电价 + 需量） |
 | `optimize_storage` | workflow | MILP 求解储能充放电计划（爬坡/SOC/温度约束） |
-| `compute_carbon` | workflow | 电碳双因子计量（C(τ) + Cr(τ)） |
+| `compute_carbon_factors` | workflow | **优化前**计算 C(τ)/Cr(τ) 碳因子，供 MILP 优化器使用 |
 | `factory_summary` | workflow | 生成审批摘要（收益/风险/检查项） |
-| `human_approval` | human | 人工审批 interrupt（approve/reject/revise） |
+| `compute_carbon_dispatch` | workflow | **优化后**用预计算碳因子核算方案碳排放（直接 C + 责任 Cr） |
+| `storage_approval` | human | 储能审批 interrupt（approve/reject/revise），由 StorageApprovalAgent 支撑 |
 | `parse_revision` | llm | LLM 解析审批修改意图（最多 2 轮澄清 + 1 次表单回退） |
 | `apply_revision` | workflow | 合并审批修改（约束只能收紧） |
 | `freeze_plan` | system | 批准后冻结方案 |
@@ -81,16 +83,17 @@ START → initialize_run → load_inputs
 ```
 更新后：
 ```
-START → ingest_raw_data → archive_data → initialize_run → load_inputs
-  load_inputs ──ok──→ compute_tariff ──ok──→ optimize_storage
+START → ingest_raw_data → initialize_run → load_inputs
+  load_inputs ──ok──→ compute_tariff ──ok──→ compute_carbon_factors ──ok──→ optimize_storage
              └──failed──→ fail_run → END
 
-  optimize_storage ──ok──→ compute_carbon ──ok──→ factory_summary ──ok──→ human_approval
+  optimize_storage ──ok──→ compute_carbon_dispatch ──ok──→ factory_summary ──ok──→ storage_approval
                   └──failed──→ fail_run                    └──failed──→ fail_run
 
-  human_approval ──approve──→ freeze_plan → END
+  storage_approval ──approve──→ freeze_plan → archive_data → END
                 ──reject───→ close_rejected → END
-                ──revise───→ parse_revision → apply_revision → optimize_storage（重新优化）
+                 ──revise───→ parse_revision → apply_revision → optimize_storage（重新优化）
+                 注：revise 回路复用已计算的 carbon_factors，不重算碳因子
 ```
 
 ### 审批回路
@@ -101,22 +104,36 @@ revise 分支是核心安全机制：工程师可以收紧约束（提高备用 
 
 ### LLM 语义层与 JSON 输出约束
 
-主图中有 4 个 LLM 节点（ingest_raw_data / archive_data / parse_revision / 监控图的 analyze_anomaly），
-外加 1 个离线工具（复盘蒸馏）。它们严格遵守设计原则：**只做语义理解，不做优化和硬约束**。
+系统严格遵守设计原则：**LLM 只做语义理解，不做优化和硬约束**。
+电价计算和碳因子计算是确定性算法工具，不是 LLM agent。
 
-| Agent | 位置 | 职责 |
+### LLM Agent 清单（5 个，各有独立 API 端点）
+
 |---|---|---|
-| 数据清洗 `DataIngestAgent` | 主图 ingest_raw_data | 原始文件 → 判类型 + 列名映射 + 质量检测 |
-| 数据封存 `DataArchiveAgent` | 主图 archive_data | 清洗结果 → 血缘记录 + 合规标签 + 落盘 |
-| 审批解析 `RevisionParser` | 主图 parse_revision | 工程师自然语言修改意图 → 结构化 revision（含澄清回路） |
-| 异常工况 `AnomalyMonitorAgent` | 监控图 analyze_anomaly | 实时信号 → 告警级别 + 根因 + 是否触发重算 |
-| 复盘蒸馏 `DistillationReviewAgent` | 离线 CLI | revise_pairs 积累 → 高频模式 + prompt 改进建议 |
+| Agent | API 端点 | 位置 | 职责 |
+|---|---|---|---|
+| 数据清洗 `DataIngestAgent` | `POST /api/agents/ingest` | 主图 ingest_raw_data | 原始文件 → 判类型 + 列名映射 + 质量检测 |
+| 数据封存 `DataArchiveAgent` | `POST /api/agents/archive` | 主图 archive_data | 清洗结果 → 血缘记录 + 合规标签 + 落盘 |
+| 储能审批 `StorageApprovalAgent` | `POST /api/agents/approval/interpret` | 主图 storage_approval | 工程师指令 → 物理含义 + 结构化约束 + 重算决策 |
+| 异常工况 `AnomalyMonitorAgent` | `POST /api/agents/anomaly/analyze` | 监控图 analyze_anomaly | 实时信号 → 告警级别 + 根因 + 是否触发重算 |
+| 复盘蒸馏 `DistillationReviewAgent` | `POST /api/agents/distillation/review` | 离线 | revise_pairs → 高频模式 + prompt 改进建议 |
+
+> `RevisionParser` 和 `SlotValidator` 是 `StorageApprovalAgent` 的内部支撑类，不单独暴露 API。
+
+### 确定性工具（非 Agent）
+
+| 工具 | 类名 | 位置 | 职责 |
+|---|---|---|---|
+| 分时电费计算器 | `TariffCalculator` | 主图 compute_tariff | 湖南峰谷电价 + 需量电费（纯数学，无 LLM） |
+| 电碳双因子计量 | `CarbonAccountant` | 主图 compute_carbon_factors / compute_carbon_dispatch | C(τ)/Cr(τ) 碳因子计算（纯数学，无 LLM） |
+| MILP 储能优化器 | `MILPStorageOptimizer` | 主图 optimize_storage | PuLP+CBC 线性规划求解（纯数学，无 LLM） |
+| 种子数据提供者 | `SeedDataProvider` | 主图 load_inputs | 合成数据 + CSV 数据加载（无 LLM） |
 
 **JSON 双层约束**：`client.chat_json(response_schema=...)` 同时在两个层面限制 LLM 输出：
 1. API 层 — `response_format={"type": "json_object"}` 强制 JSON mode；
 2. Prompt 层 — schema 嵌入 system prompt，让模型知道确切的输出结构。
 
-5 个 schema 集中定义在 `json_schemas.py`，确保所有 agent 输出可被 Pydantic 契约安全解析。
+6 个 schema 集中定义在 `json_schemas.py`，确保所有 agent 输出可被 Pydantic 契约安全解析。
 
 ## 四、三大算法模块
 
@@ -255,7 +272,7 @@ $python = "...\energy_agent\.venv\Scripts\python.exe"
 | 分时电费 + 需量电费 | ✓ 20 测试 |
 | 案例 1 端到端跑通 | ✓ approved |
 | 案例 2 revise 回路跑通 | ✓ approved V2 |
-| 单元测试总数 | ✓ 46 passed |
+| 单元测试总数 | ✓ 51 passed |
 
 ## 九、与 V1 的对比
 

@@ -84,6 +84,20 @@ def validate_slots(
                     continue
                 cleaned[slot_name] = SlotInfo(value=v, confidence=confidence, reasoning=reasoning)
 
+            elif slot_name == "max_charge_power_kw":
+                v = float(value)
+                if v <= 0:
+                    errors.append(f"{slot_name}={v} 必须 > 0")
+                    continue
+                cleaned[slot_name] = SlotInfo(value=v, confidence=confidence, reasoning=reasoning)
+
+            elif slot_name == "max_cell_temperature_c":
+                v = float(value)
+                if v <= 0 or v > 80:
+                    errors.append(f"{slot_name}={v} 超出合理范围 (0, 80]")
+                    continue
+                cleaned[slot_name] = SlotInfo(value=v, confidence=confidence, reasoning=reasoning)
+
             elif slot_name == "blocked_intervals":
                 intervals: list[TimeInterval] = []
                 for iv in value:

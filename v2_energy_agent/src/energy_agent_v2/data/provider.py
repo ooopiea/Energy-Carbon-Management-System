@@ -233,6 +233,14 @@ class SeedDataProvider:
         )
         if effective_fetcher is not None:
             start, end = timestamps[0], timestamps[-1]
+            # 真实负荷优先（替代合成负荷）
+            if hasattr(effective_fetcher, "fetch_real_load"):
+                try:
+                    real_load = effective_fetcher.fetch_real_load(start)
+                    if real_load and len(real_load) == POINTS_PER_DAY:
+                        load = np.array(real_load, dtype=float)
+                except Exception:
+                    pass  # 回退合成负荷
             try:
                 remote_mix = effective_fetcher.fetch_generation_mix(start, end)
             except Exception:
@@ -265,6 +273,14 @@ class SeedDataProvider:
                 update={k: v for k, v in battery_override.items() if v is not None}
             )
 
+        # Collect data provenance from fetcher (actual dates vs requested)
+        provenance = {}
+        if effective_fetcher is not None and hasattr(effective_fetcher, "get_data_provenance"):
+            try:
+                provenance = effective_fetcher.get_data_provenance(target_date)
+            except Exception:
+                provenance = {}
+
         return DispatchInputBundleV2(
             data_version=f"{data_source}-{self.seed}" if data_source == "seed" else data_source,
             site_id=site_id,
@@ -282,4 +298,5 @@ class SeedDataProvider:
             ),
             region=self.REGION,
             tariff=tariff,
+            data_source_info=provenance,
         )

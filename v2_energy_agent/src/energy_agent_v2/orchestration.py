@@ -1,6 +1,7 @@
 ﻿# V2 LangGraph orchestration: storage optimize + tariff + carbon dual-factor + approval loop.
-# Path: initialize_run -> load_inputs -> compute_tariff -> optimize_storage -> compute_carbon
-# -> factory_summary -> human_approval -> [approve]freeze | [reject]close | [revise]apply_revision -> optimize_storage
+# Path: ingest_raw_data -> initialize_run -> load_inputs -> compute_tariff -> compute_carbon_factors
+# -> optimize_storage -> compute_carbon_dispatch -> factory_summary -> storage_approval
+# -> [approve]freeze_plan -> archive_data | [reject]close | [revise]apply_revision -> optimize_storage
 # Any node failure -> fail_run. events uses add reducer so the full event chain is preserved.
 from __future__ import annotations
 
@@ -105,6 +106,7 @@ class EnergyDispatchStateV2(TypedDict, total=False):
     tariff_result: dict[str, Any] | None
     storage_result: dict[str, Any] | None
     carbon_result: dict[str, Any] | None
+    carbon_factors: dict[str, Any] | None
     factory_summary: dict[str, Any] | None
     approval_decision: dict[str, Any] | None
     events: Annotated[list[dict[str, Any]], add]
@@ -118,7 +120,7 @@ class EnergyDispatchStateV2(TypedDict, total=False):
 
 
 class AppContextV2:
-    def __init__(self, data_provider: Any, storage_optimizer: Any, carbon_accountant: Any, tariff_calculator: Any, revision_parser: Any = None, ingest_agent: Any = None, archive_agent: Any = None) -> None:
+    def __init__(self, data_provider: Any, storage_optimizer: Any, carbon_accountant: Any, tariff_calculator: Any, revision_parser: Any = None, ingest_agent: Any = None, archive_agent: Any = None, approval_agent: Any = None, anomaly_agent: Any = None, distillation_agent: Any = None) -> None:
         self.data_provider = data_provider
         self.storage_optimizer = storage_optimizer
         self.carbon_accountant = carbon_accountant
@@ -126,6 +128,9 @@ class AppContextV2:
         self.revision_parser = revision_parser
         self.ingest_agent = ingest_agent
         self.archive_agent = archive_agent
+        self.approval_agent = approval_agent
+        self.anomaly_agent = anomaly_agent
+        self.distillation_agent = distillation_agent
 
 
 def now_utc() -> datetime:
@@ -238,7 +243,17 @@ async def optimize_storage_node(state: EnergyDispatchStateV2, runtime: Runtime[A
     started = time.perf_counter()
     try:
         bundle = DispatchInputBundleV2.model_validate(state["input_bundle"])
-        request = StorageDispatchRequestV2(dispatch_run_id=state["dispatch_run_id"], plan_id=state["current_plan_id"], plan_version=state["current_plan_version"], objective=DispatchObjective(state["objective"]), inputs=bundle, revision=(DispatchRevision.model_validate(state["revision_request"]) if state.get("revision_request") else None))
+        # 传递预计算碳因子 Cr(τ) 给优化器（来自 compute_carbon_factors 节点）
+        carbon_override = None
+        cf_dict = state.get("carbon_factors")
+        if cf_dict:
+            try:
+                cf = CarbonAccountingResult.model_validate(cf_dict)
+                if len(cf.responsibility_factor_cr_kg_per_kwh) == len(bundle.timestamps):
+                    carbon_override = cf.responsibility_factor_cr_kg_per_kwh
+            except Exception:
+                pass
+        request = StorageDispatchRequestV2(dispatch_run_id=state["dispatch_run_id"], plan_id=state["current_plan_id"], plan_version=state["current_plan_version"], objective=DispatchObjective(state["objective"]), inputs=bundle, revision=(DispatchRevision.model_validate(state["revision_request"]) if state.get("revision_request") else None), carbon_factors_override=carbon_override)
         result = runtime.context.storage_optimizer.optimize(request)
         duration = round((time.perf_counter() - started) * 1000)
         if not result.constraint_check.passed:
@@ -254,25 +269,47 @@ async def optimize_storage_node(state: EnergyDispatchStateV2, runtime: Runtime[A
         return {"error": error.model_dump(mode="json"), **rec}
 
 
-async def compute_carbon_node(state: EnergyDispatchStateV2, runtime: Runtime[AppContextV2]) -> dict[str, Any]:
+async def compute_carbon_factors_node(state: EnergyDispatchStateV2, runtime: Runtime[AppContextV2]) -> dict[str, Any]:
+    """在 optimize 之前计算 C(tau)/Cr(tau) 碳因子，供 MILP 优化器使用。"""
+    started = time.perf_counter()
+    try:
+        bundle = DispatchInputBundleV2.model_validate(state["input_bundle"])
+        acc = runtime.context.carbon_accountant
+        if not bundle.generation_mix:
+            rec = await record_node(state, "compute_carbon_factors", "无发电结构数据，碳因子计算跳过")
+            return {"carbon_factors": None, "error": None, **rec}
+        factors = acc.compute_factors(bundle.generation_mix, bundle.emission_factors, bundle.region)
+        duration = round((time.perf_counter() - started) * 1000)
+        n = len(factors.direct_factor_c_kg_per_kwh)
+        rec = await record_node(state, "compute_carbon_factors", f"碳因子已计算 C均值 {sum(factors.direct_factor_c_kg_per_kwh) / n:.4f}, Cr均值 {sum(factors.responsibility_factor_cr_kg_per_kwh) / n:.4f}", duration_ms=duration, payload={"C_mean": round(sum(factors.direct_factor_c_kg_per_kwh) / n, 4), "Cr_mean": round(sum(factors.responsibility_factor_cr_kg_per_kwh) / n, 4)})
+        return {"carbon_factors": factors.model_dump(mode="json"), "error": None, **rec}
+    except Exception as exc:
+        error = ErrorDetail(code="CARBON_FACTORS_FAILED", message=str(exc), retryable=False)
+        rec = await record_node(state, "compute_carbon_factors", error.message, status="failed")
+        return {"error": error.model_dump(mode="json"), **rec}
+
+
+async def compute_carbon_dispatch_node(state: EnergyDispatchStateV2, runtime: Runtime[AppContextV2]) -> dict[str, Any]:
+    """在 optimize 之后用预计算碳因子核算方案碳排放（直接 C + 责任 Cr）。"""
     started = time.perf_counter()
     try:
         bundle = DispatchInputBundleV2.model_validate(state["input_bundle"])
         storage = StorageOptimizationResult.model_validate(state["storage_result"])
         step_hours = bundle.time_step_minutes / 60
         acc = runtime.context.carbon_accountant
-        if not bundle.generation_mix:
-            rec = await record_node(state, "compute_carbon", "无发电结构数据，电碳计量跳过")
+        cf_dict = state.get("carbon_factors")
+        if not cf_dict:
+            rec = await record_node(state, "compute_carbon_dispatch", "无预计算碳因子，电碳计量跳过")
             return {"carbon_result": None, "error": None, **rec}
-        factors = acc.compute_factors(bundle.generation_mix, bundle.emission_factors, bundle.region)
+        factors = CarbonAccountingResult.model_validate(cf_dict)
         dispatch = acc.account_dispatch(factors, storage.baseline_grid_import_power_kw, storage.grid_import_power_kw, step_hours)
         duration = round((time.perf_counter() - started) * 1000)
         n = len(factors.direct_factor_c_kg_per_kwh)
-        rec = await record_node(state, "compute_carbon", f"直接碳减排 {dispatch.direct_carbon_reduction_kg:.1f} kg, 责任碳减排 {dispatch.responsibility_carbon_reduction_kg:.1f} kg", duration_ms=duration, payload={"C_mean": round(sum(factors.direct_factor_c_kg_per_kwh) / n, 4), "Cr_mean": round(sum(factors.responsibility_factor_cr_kg_per_kwh) / n, 4)})
+        rec = await record_node(state, "compute_carbon_dispatch", f"直接碳减排 {dispatch.direct_carbon_reduction_kg:.1f} kg, 责任碳减排 {dispatch.responsibility_carbon_reduction_kg:.1f} kg", duration_ms=duration, payload={"C_mean": round(sum(factors.direct_factor_c_kg_per_kwh) / n, 4), "Cr_mean": round(sum(factors.responsibility_factor_cr_kg_per_kwh) / n, 4)})
         return {"carbon_result": dispatch.model_dump(mode="json"), "error": None, **rec}
     except Exception as exc:
-        error = ErrorDetail(code="CARBON_FAILED", message=str(exc), retryable=False)
-        rec = await record_node(state, "compute_carbon", error.message, status="failed")
+        error = ErrorDetail(code="CARBON_DISPATCH_FAILED", message=str(exc), retryable=False)
+        rec = await record_node(state, "compute_carbon_dispatch", error.message, status="failed")
         return {"error": error.model_dump(mode="json"), **rec}
 
 
@@ -299,10 +336,10 @@ async def factory_summary_node(state: EnergyDispatchStateV2, runtime: Runtime[Ap
         return {"error": error.model_dump(mode="json"), **rec}
 
 
-async def human_approval_node(state: EnergyDispatchStateV2, runtime: Runtime[AppContextV2]) -> dict[str, Any]:
+async def storage_approval_node(state: EnergyDispatchStateV2, runtime: Runtime[AppContextV2]) -> dict[str, Any]:
     raw = interrupt({"dispatch_run_id": state["dispatch_run_id"], "plan_id": state["current_plan_id"], "plan_version": state["current_plan_version"], "summary": state.get("factory_summary"), "allowed_decisions": ["approve", "reject", "revise"]})
     decision = ApprovalDecision.model_validate(raw)
-    rec = await record_node(state, "human_approval", f"审批决策: {decision.decision}", payload={"decision": decision.decision, "decided_by": decision.decided_by, "comment": decision.comment})
+    rec = await record_node(state, "storage_approval", f"审批决策: {decision.decision}", payload={"decision": decision.decision, "decided_by": decision.decided_by, "comment": decision.comment})
     return {"approval_decision": decision.model_dump(mode="json"), **rec}
 
 
@@ -321,7 +358,9 @@ async def parse_revision_node(state: EnergyDispatchStateV2, runtime: Runtime[App
     from energy_agent_v2.llm.slot_validator import build_revision
 
     decision = ApprovalDecision.model_validate(state["approval_decision"])
-    parser = runtime.context.revision_parser
+    # 优先使用 approval_agent（包装了 RevisionParser + 物理含义解读），回退到 revision_parser
+    approval_agent = runtime.context.approval_agent
+    parser = approval_agent or runtime.context.revision_parser
     comment = decision.comment
     storage_result = state.get("storage_result")
     run_id = state["dispatch_run_id"]
@@ -418,7 +457,16 @@ async def apply_revision_node(state: EnergyDispatchStateV2, runtime: Runtime[App
 
 
 def _merge_revision(current: DispatchRevision | None, requested: DispatchRevision) -> DispatchRevision:
-    return DispatchRevision(terminal_soc_min_ratio=max(filter(None, [requested.terminal_soc_min_ratio, current.terminal_soc_min_ratio if current else None]), default=None), reserve_soc_min_ratio=max(filter(None, [requested.reserve_soc_min_ratio, current.reserve_soc_min_ratio if current else None]), default=None), max_discharge_power_kw=min(filter(None, [requested.max_discharge_power_kw, current.max_discharge_power_kw if current else None]), default=None), blocked_intervals=(current.blocked_intervals if current else []) + requested.blocked_intervals, objective=requested.objective or (current.objective if current else None), max_cycles_per_day=min(filter(None, [requested.max_cycles_per_day, current.max_cycles_per_day if current else None]), default=None))
+    return DispatchRevision(
+        terminal_soc_min_ratio=max(filter(None, [requested.terminal_soc_min_ratio, current.terminal_soc_min_ratio if current else None]), default=None),
+        reserve_soc_min_ratio=max(filter(None, [requested.reserve_soc_min_ratio, current.reserve_soc_min_ratio if current else None]), default=None),
+        max_discharge_power_kw=min(filter(None, [requested.max_discharge_power_kw, current.max_discharge_power_kw if current else None]), default=None),
+        max_charge_power_kw=min(filter(None, [requested.max_charge_power_kw, current.max_charge_power_kw if current else None]), default=None),
+        max_cell_temperature_c=min(filter(None, [requested.max_cell_temperature_c, current.max_cell_temperature_c if current else None]), default=None),
+        blocked_intervals=(current.blocked_intervals if current else []) + requested.blocked_intervals,
+        objective=requested.objective or (current.objective if current else None),
+        max_cycles_per_day=min(filter(None, [requested.max_cycles_per_day, current.max_cycles_per_day if current else None]), default=None),
+    )
 
 
 async def freeze_plan_node(state: EnergyDispatchStateV2, runtime: Runtime[AppContextV2]) -> dict[str, Any]:
@@ -443,32 +491,34 @@ async def fail_run_node(state: EnergyDispatchStateV2, runtime: Runtime[AppContex
 def build_dispatch_graph(checkpointer: Any = None) -> Any:
     builder = StateGraph(EnergyDispatchStateV2, context_schema=AppContextV2)
     builder.add_node("ingest_raw_data", ingest_raw_data_node)
-    builder.add_node("archive_data", archive_data_node)
     builder.add_node("initialize_run", initialize_run_node)
     builder.add_node("load_inputs", load_inputs_node)
     builder.add_node("compute_tariff", compute_tariff_node)
+    builder.add_node("compute_carbon_factors", compute_carbon_factors_node)
     builder.add_node("optimize_storage", optimize_storage_node)
-    builder.add_node("compute_carbon", compute_carbon_node)
+    builder.add_node("compute_carbon_dispatch", compute_carbon_dispatch_node)
     builder.add_node("factory_summary", factory_summary_node)
-    builder.add_node("human_approval", human_approval_node)
+    builder.add_node("storage_approval", storage_approval_node)
+    builder.add_node("archive_data", archive_data_node)
     builder.add_node("parse_revision", parse_revision_node)
     builder.add_node("apply_revision", apply_revision_node)
     builder.add_node("freeze_plan", freeze_plan_node)
     builder.add_node("close_rejected", close_rejected_node)
     builder.add_node("fail_run", fail_run_node)
     builder.add_edge(START, "ingest_raw_data")
-    builder.add_conditional_edges("ingest_raw_data", route_ok_or_fail, {"ok": "archive_data", "failed": "fail_run"})
-    builder.add_conditional_edges("archive_data", route_ok_or_fail, {"ok": "initialize_run", "failed": "fail_run"})
+    builder.add_conditional_edges("ingest_raw_data", route_ok_or_fail, {"ok": "initialize_run", "failed": "fail_run"})
     builder.add_edge("initialize_run", "load_inputs")
     builder.add_conditional_edges("load_inputs", route_ok_or_fail, {"ok": "compute_tariff", "failed": "fail_run"})
-    builder.add_conditional_edges("compute_tariff", route_ok_or_fail, {"ok": "optimize_storage", "failed": "fail_run"})
-    builder.add_conditional_edges("optimize_storage", route_ok_or_fail, {"ok": "compute_carbon", "failed": "fail_run"})
-    builder.add_conditional_edges("compute_carbon", route_ok_or_fail, {"ok": "factory_summary", "failed": "fail_run"})
-    builder.add_conditional_edges("factory_summary", route_ok_or_fail, {"ok": "human_approval", "failed": "fail_run"})
-    builder.add_conditional_edges("human_approval", route_after_approval, {"approve": "freeze_plan", "reject": "close_rejected", "revise": "parse_revision"})
+    builder.add_conditional_edges("compute_tariff", route_ok_or_fail, {"ok": "compute_carbon_factors", "failed": "fail_run"})
+    builder.add_conditional_edges("compute_carbon_factors", route_ok_or_fail, {"ok": "optimize_storage", "failed": "fail_run"})
+    builder.add_conditional_edges("optimize_storage", route_ok_or_fail, {"ok": "compute_carbon_dispatch", "failed": "fail_run"})
+    builder.add_conditional_edges("compute_carbon_dispatch", route_ok_or_fail, {"ok": "factory_summary", "failed": "fail_run"})
+    builder.add_conditional_edges("factory_summary", route_ok_or_fail, {"ok": "storage_approval", "failed": "fail_run"})
+    builder.add_conditional_edges("storage_approval", route_after_approval, {"approve": "freeze_plan", "reject": "close_rejected", "revise": "parse_revision"})
     builder.add_edge("parse_revision", "apply_revision")
     builder.add_edge("apply_revision", "optimize_storage")
-    builder.add_edge("freeze_plan", END)
+    builder.add_edge("freeze_plan", "archive_data")
+    builder.add_edge("archive_data", END)
     builder.add_edge("close_rejected", END)
     builder.add_edge("fail_run", END)
     return builder.compile(checkpointer=checkpointer) if checkpointer else builder.compile()

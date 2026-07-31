@@ -147,11 +147,13 @@ def _snapshot(thread_id: str, result: dict[str, Any]) -> dict[str, Any]:
         "input_bundle": result.get("input_bundle"),
         "storage_result": result.get("storage_result"),
         "tariff_result": result.get("tariff_result"),
-        "carbon_result": result.get("carbon_result"),
-        "factory_summary": result.get("factory_summary"),
-        "approval_decision": result.get("approval_decision"),
-        "events": result.get("events", []),
-        "error": result.get("error"),
+       "carbon_result": result.get("carbon_result"),
+       "carbon_factors": result.get("carbon_factors"),
+       "factory_summary": result.get("factory_summary"),
+       "approval_decision": result.get("approval_decision"),
+       "events": result.get("events", []),
+       "error": result.get("error"),
+       "data_source_info": (result.get("input_bundle") or {}).get("data_source_info", {}),
         "paused": paused,
         "interrupt_type": _interrupt_type(result) if paused else None,
         "interrupt": _interrupt_payload(result) if paused else None,
@@ -182,7 +184,15 @@ async def dashboard():
     """提供实时交互前端页面(单文件 HTML,调本服务的 API)。"""
     from fastapi.responses import FileResponse
 
-    return FileResponse(Path(__file__).resolve().parent / "dashboard.html")
+    return FileResponse(Path(__file__).resolve().parent / "dashboard_new.html")
+
+
+@app.get("/chart.min.js")
+async def chart_js():
+    """Serve local Chart.js library (CDN blocked in local sandbox)."""
+    from fastapi.responses import FileResponse
+
+    return FileResponse(Path(__file__).resolve().parent / "chart.min.js", media_type="application/javascript")
 
 
 @app.get("/api/objectives")
@@ -207,6 +217,9 @@ async def data_health() -> dict:
     if not gen_dates or not price_dates:
         return {"available": False}
 
+    load_idx = f._build_load_index()
+    load_dates = sorted(d.isoformat() for d in load_idx) if load_idx else []
+
     overlap = sorted(set(gen_dates) & set(price_dates))
     return {
         "available": True,
@@ -220,6 +233,11 @@ async def data_health() -> dict:
             "end": price_dates[-1],
             "days": len(price_dates),
         },
+        "load_coverage": {
+            "start": load_dates[0],
+            "end": load_dates[-1],
+            "days": len(load_dates),
+        } if load_dates else None,
         "overlap_days": len(overlap),
         "data_version": "csv-realtime",
     }
@@ -227,7 +245,7 @@ async def data_health() -> dict:
 
 @app.post("/api/runs")
 async def create_run(req: CreateRunRequest) -> dict:
-    """创建一次调度,自动跑到第一个 interrupt(通常是 human_approval)。"""
+    """创建一次调度,自动跑到第一个 interrupt(通常是 storage_approval)。"""
     try:
         target = date.fromisoformat(req.target_date)
     except ValueError:
@@ -280,6 +298,150 @@ async def resume_run(thread_id: str, req: ResumeRequest) -> dict:
         raise HTTPException(500, f"resume 执行失败: {exc}") from exc
 
     return _snapshot(thread_id, result)
+
+
+# ---------------------------------------------------------------------------
+# Agent API: 轻量级 per-agent 端点，可独立调用单个 agent
+# ---------------------------------------------------------------------------
+
+class IngestRequest(BaseModel):
+    file_name: str
+    file_path: str = ""
+    file_format: str = "csv"
+    uploaded_by: str = "web"
+    raw_content_preview: str = ""
+
+
+class ApprovalInterpretRequest(BaseModel):
+    comment: str
+    storage_result: dict[str, Any]
+
+
+class ArchiveAgentRequest(BaseModel):
+    ingest_result: dict[str, Any]
+
+
+@app.post("/api/agents/ingest")
+async def agent_ingest(req: IngestRequest) -> dict:
+    """DataIngestAgent: 原始文件 -> 类型判断 + 字段映射 + 质量检测。"""
+    from datetime import datetime
+
+    from energy_agent_v2.contracts import RawDataFile
+
+    if _context.ingest_agent is None:
+        raise HTTPException(503, "ingest_agent 未配置（需 LLM_API_KEY）")
+    raw = RawDataFile(
+        file_name=req.file_name,
+        file_path=req.file_path,
+        file_format=req.file_format,
+        uploaded_by=req.uploaded_by,
+        uploaded_at=datetime.now(UTC),
+        raw_content_preview=req.raw_content_preview,
+        file_size_bytes=len(req.raw_content_preview.encode()),
+    )
+    result = _context.ingest_agent.ingest(raw)
+    return result.model_dump(mode="json")
+
+
+@app.post("/api/agents/approval/interpret")
+async def agent_approval_interpret(req: ApprovalInterpretRequest) -> dict:
+    """StorageApprovalAgent: 工程师指令 -> 物理含义 + 结构化约束 + 重算决策。"""
+    if _context.approval_agent is None:
+        raise HTTPException(503, "approval_agent 未配置（需 LLM_API_KEY）")
+    result = _context.approval_agent.interpret_command(req.comment, req.storage_result)
+    return result
+
+
+@app.post("/api/agents/archive")
+async def agent_archive(req: ArchiveAgentRequest) -> dict:
+    """DataArchiveAgent: 清洗结果 -> 血缘记录 + 落盘。"""
+    from energy_agent_v2.contracts import DataIngestResult
+    from pydantic import ValidationError as PydanticValidationError
+
+    if _context.archive_agent is None:
+        raise HTTPException(503, "archive_agent 未配置（需 LLM_API_KEY）")
+    try:
+        ingest = DataIngestResult.model_validate(req.ingest_result)
+    except PydanticValidationError as e:
+        raise HTTPException(422, f"ingest_result validation failed: {e.errors()[:3]}")
+    result = _context.archive_agent.archive(ingest)
+    return result.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# Daily JSON Stream: 把一次完整 run 重建为结构化每日记录
+# ---------------------------------------------------------------------------
+
+
+class AnomalyAnalyzeRequest(BaseModel):
+    signals: list[dict[str, Any]]
+
+
+class DistillationReviewRequest(BaseModel):
+    records: list[dict[str, Any]] | None = None
+    review_period: str = ""
+
+
+@app.post("/api/agents/anomaly/analyze")
+async def agent_anomaly_analyze(req: AnomalyAnalyzeRequest) -> dict:
+    from energy_agent_v2.contracts import AnomalySignal
+    from pydantic import ValidationError as PydanticValidationError
+
+    if _context.anomaly_agent is None:
+        raise HTTPException(503, "anomaly_agent not configured (LLM_API_KEY required)")
+    if not req.signals:
+        raise HTTPException(400, "signals must not be empty")
+    try:
+        signals = [AnomalySignal.model_validate(s) for s in req.signals]
+    except PydanticValidationError as e:
+        raise HTTPException(422, f"signal validation failed: {e.errors()[:3]}")
+    alert = _context.anomaly_agent.analyze(signals)
+    return alert.model_dump(mode="json")
+
+
+@app.post("/api/agents/distillation/review")
+async def agent_distillation_review(req: DistillationReviewRequest) -> dict:
+    if _context.distillation_agent is None:
+        raise HTTPException(503, "distillation_agent not configured (LLM_API_KEY required)")
+    insight = _context.distillation_agent.review(
+        records=req.records,
+        review_period=req.review_period,
+    )
+    return insight.model_dump(mode="json")
+
+@app.get("/api/daily-stream/{thread_id}")
+async def daily_stream(thread_id: str) -> dict:
+    """重建每日 JSON 流：清洗输入 → MILP 结果 → 审批决策 → 重算结果。"""
+    snap = _snapshots.get(thread_id)
+    if snap is None:
+        raise HTTPException(404, f"未找到 thread_id={thread_id}")
+    events = snap.get("events", [])
+    storage = snap.get("storage_result")
+    tariff = snap.get("tariff_result")
+    carbon_factors = snap.get("carbon_factors")
+    carbon_result = snap.get("carbon_result")
+    plan_versions: dict[int, list] = {}
+    for ev in events:
+        ver = 1
+        for p in ev.get("event_id", "").split(":"):
+            if p.startswith("v") and p[1:].isdigit():
+                ver = int(p[1:])
+                break
+        plan_versions.setdefault(ver, []).append(ev)
+    stages = []
+    for ver in sorted(plan_versions.keys()):
+        ver_events = plan_versions[ver]
+        stage = {"plan_version": ver, "events": [{"node_id": e["node_id"], "status": e["status"], "summary": e["summary"], "duration_ms": e.get("duration_ms")} for e in ver_events], "objective": snap.get("objective")}
+        approval_evs = [e for e in ver_events if e["node_id"] == "storage_approval"]
+        if approval_evs:
+            payload = approval_evs[0].get("payload", {})
+            stage["approval"] = {"decision": payload.get("decision"), "decided_by": payload.get("decided_by"), "comment": payload.get("comment")}
+        if storage and ver == sorted(plan_versions.keys())[-1]:
+            stage["storage_summary"] = {"plan_id": storage.get("plan_id"), "plan_version": storage.get("plan_version"), "energy_cost_saving_cny": storage.get("energy_cost_saving_cny", 0), "peak_reduction_kw": storage.get("peak_reduction_kw", 0), "max_cell_temperature_c": storage.get("max_cell_temperature_c", 0), "terminal_soc_ratio": storage.get("terminal_soc_ratio", 0), "solver_status": storage.get("solver_status"), "constraint_passed": storage.get("constraint_check", {}).get("passed", False)}
+        stages.append(stage)
+    cf_c = carbon_factors.get("direct_factor_c_kg_per_kwh", []) if carbon_factors else []
+    cf_cr = carbon_factors.get("responsibility_factor_cr_kg_per_kwh", []) if carbon_factors else []
+    return {"thread_id": thread_id, "dispatch_run_id": snap.get("dispatch_run_id"), "run_status": snap.get("run_status"), "total_plan_versions": len(plan_versions), "tariff_summary": {"daily_energy_cost_cny": tariff.get("energy_cost_cny") if tariff else None, "monthly_demand_cost_cny": tariff.get("demand_cost_cny") if tariff else None, "effective_price_cny_per_kwh": tariff.get("effective_price_cny_per_kwh") if tariff else None} if tariff else None, "carbon_factors_summary": {"C_mean": round(sum(cf_c)/len(cf_c), 4) if cf_c else None, "Cr_mean": round(sum(cf_cr)/len(cf_cr), 4) if cf_cr else None, "library_version": carbon_factors.get("emission_factor_library_version") if carbon_factors else None} if carbon_factors else None, "carbon_dispatch_summary": {"direct_carbon_reduction_kg": carbon_result.get("direct_carbon_reduction_kg") if carbon_result else None, "responsibility_carbon_reduction_kg": carbon_result.get("responsibility_carbon_reduction_kg") if carbon_result else None} if carbon_result else None, "stages": stages, "event_count": len(events)}
 
 
 if __name__ == "__main__":

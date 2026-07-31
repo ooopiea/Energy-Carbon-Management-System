@@ -105,11 +105,15 @@ class DispatchRevision(BaseModel):
     terminal_soc_min_ratio: float | None = Field(default=None, ge=0, le=1)
     reserve_soc_min_ratio: float | None = Field(default=None, ge=0, le=1)
     max_discharge_power_kw: float | None = Field(default=None, gt=0)
+    max_charge_power_kw: float | None = Field(default=None, gt=0)
     blocked_intervals: list[TimeInterval] = Field(default_factory=list)
     objective: DispatchObjective | None = None
 
     # V2.2: 充放电循环次数约束。"一充一放"=1, "两充两放"=2
     max_cycles_per_day: int | None = Field(default=None, ge=1, le=8)
+
+    # V2.3: 温度安全上限约束（工程师可收紧，不可放宽）
+    max_cell_temperature_c: float | None = Field(default=None, gt=0)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +152,7 @@ class EmissionFactorLibrary(BaseModel):
             GenerationSource.PURCHASE.value: 0.5366,
         }
     )
-    source_label: str = "default"
+    source_label: str = "ef-hunan-2022-v1"
     calibrated_region: str | None = None
 
 
@@ -286,6 +290,8 @@ class DispatchInputBundleV2(BaseModel):
     region: str = "cn-hunan"
     # 电费规则（可选，用于精细电费核算）
     tariff: TariffSchedule | None = None
+    # 数据溯源：实际使用的数据日期与覆盖范围（透明化 nearest-day 替代）
+    data_source_info: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_series(self) -> DispatchInputBundleV2:
@@ -388,9 +394,12 @@ class StorageDispatchRequestV2(BaseModel):
     revision: DispatchRevision | None = None
     # 加权目标权重（仅 objective=WEIGHTED 时生效）
     # alpha: 电费权重（含电度+需量），beta: 碳排放权重
-    # 默认 alpha=1, beta=0.01 表示 1 元电费 ≈ 0.01 kg 碳排
+   # 默认 alpha=1, beta=0.01 表示 1 元电费 ≈ 0.01 kg 碳排
     weight_alpha_cost: float = Field(default=1.0, ge=0)
     weight_beta_carbon: float = Field(default=0.01, ge=0)
+    carbon_factors_override: list[float] | None = None
+    # 预计算的碳因子（来自 compute_carbon_factors 节点），供优化器直接使用
+    # 传入 Cr(τ) 责任因子；为 None 时优化器回退到内部 _resolve_carbon_factors()
 
 
 class AgentContext(BaseModel):

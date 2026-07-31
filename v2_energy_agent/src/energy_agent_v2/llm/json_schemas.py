@@ -168,13 +168,32 @@ REVISION_SLOTS_SCHEMA: dict = {
                 "terminal_soc_min_ratio": {"type": "object"},
                 "reserve_soc_min_ratio": {"type": "object"},
                 "max_discharge_power_kw": {"type": "object"},
+                "max_charge_power_kw": {"type": "object"},
                 "blocked_intervals": {"type": "object"},
                 "objective": {"type": "object"},
+                "max_cycles_per_day": {"type": "object"},
+                "max_cell_temperature_c": {"type": "object"},
             },
         },
     },
     "required": ["slots"],
 }
+
+# ---------------------------------------------------------------------------
+# 储能审批 agent：工程师指令 -> 物理含义解读 + 结构化约束 + 重算决策
+# ---------------------------------------------------------------------------
+STORAGE_APPROVAL_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["approve", "reject", "revise"]},
+        "physical_interpretation": {"type": "string", "description": "工程师指令的物理含义解读"},
+        "should_reoptimize": {"type": "boolean", "description": "是否需要触发重新优化"},
+        "needs_clarification": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["decision", "physical_interpretation", "should_reoptimize", "confidence"],
+}
+
 
 ALL_SCHEMAS: dict[str, dict] = {
     "data_ingest": DATA_INGEST_SCHEMA,
@@ -182,4 +201,5 @@ ALL_SCHEMAS: dict[str, dict] = {
     "anomaly_monitor": ANOMALY_MONITOR_SCHEMA,
     "distillation_review": DISTILLATION_REVIEW_SCHEMA,
     "revision_slots": REVISION_SLOTS_SCHEMA,
+    "storage_approval": STORAGE_APPROVAL_SCHEMA,
 }

@@ -15,21 +15,18 @@ from energy_agent_v2.orchestration import AppContextV2, EnergyDispatchStateV2, b
 
 
 def create_app_context(revision_parser: Any = None) -> AppContextV2:
-    """实例化各算法模块，构建依赖注入容器。
-
-    revision_parser 默认 None 时自动调用 create_llm_client() 检测环境变量：
-    设了 LLM_API_KEY + LLM_BASE_URL 就接真实 GLM-5，没设就回退 mock。
-    数据清洗/封存 agent 共享同一个 LLM client，没有 key 时均为 None（主图中跳过）。
-    """
     from energy_agent_v2.algorithms.storage_optimizer import MILPStorageOptimizer
     from energy_agent_v2.algorithms.carbon_accounting import CarbonAccountant
     from energy_agent_v2.algorithms.tariff import TariffCalculator
     from energy_agent_v2.data.provider import SeedDataProvider
     from energy_agent_v2.data.csv_fetcher import CSVDataFetcher
+    from energy_agent_v2.llm.anomaly_monitor import AnomalyMonitorAgent
     from energy_agent_v2.llm.client import create_llm_client
     from energy_agent_v2.llm.data_archive import DataArchiveAgent
     from energy_agent_v2.llm.data_ingest import DataIngestAgent
+    from energy_agent_v2.llm.distillation_review import DistillationReviewAgent
     from energy_agent_v2.llm.parse_revision import RevisionParser
+    from energy_agent_v2.llm.storage_approval import StorageApprovalAgent
 
     client = None
     if revision_parser is None:
@@ -41,6 +38,9 @@ def create_app_context(revision_parser: Any = None) -> AppContextV2:
 
     ingest_agent = DataIngestAgent(client=client) if client is not None else None
     archive_agent = DataArchiveAgent(client=client) if client is not None else None
+    approval_agent = StorageApprovalAgent(client=client, revision_parser=revision_parser) if client is not None else None
+    anomaly_agent = AnomalyMonitorAgent(client=client) if client is not None else None
+    distillation_agent = DistillationReviewAgent(client=client) if client is not None else None
     return AppContextV2(
         data_provider=SeedDataProvider(fetcher=CSVDataFetcher()),
         storage_optimizer=MILPStorageOptimizer(),
@@ -49,6 +49,9 @@ def create_app_context(revision_parser: Any = None) -> AppContextV2:
         revision_parser=revision_parser,
         ingest_agent=ingest_agent,
         archive_agent=archive_agent,
+        approval_agent=approval_agent,
+        anomaly_agent=anomaly_agent,
+        distillation_agent=distillation_agent,
     )
 
 
