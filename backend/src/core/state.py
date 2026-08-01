@@ -1,0 +1,219 @@
+﻿"""LangGraph 全局状态与 Agent 状态模型。
+
+v3 的状态分为两部分：
+1. LangGraph 编排状态 (EnergySystemState)：日前调度的工作流状态
+2. 实时运行状态 (RuntimeState)：每个 tick 的实时数据，供前端展示
+"""
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import datetime
+from enum import StrEnum
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
+
+
+# ---------------------------------------------------------------------------
+# 枚举
+# ---------------------------------------------------------------------------
+
+class AgentType(StrEnum):
+    DATA = "data"
+    PREDICTION = "prediction"
+    STORAGE = "storage"
+    HVAC = "hvac"
+    MONITOR = "monitor"
+
+
+class NodeStatus(StrEnum):
+    IDLE = "idle"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    FAILED = "failed"
+    WARNING = "warning"
+
+
+class Severity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+# ---------------------------------------------------------------------------
+# Agent 节点运行记录
+# ---------------------------------------------------------------------------
+
+class AgentNodeStatus(BaseModel):
+    """单个 Agent 节点的实时状态。"""
+    agent_type: AgentType
+    node_id: str
+    name: str
+    status: NodeStatus = NodeStatus.IDLE
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_ms: int | None = None
+    last_result_summary: str = ""
+    message: str = ""
+
+
+class AgentReport(BaseModel):
+    """Agent 生成的报告。"""
+    report_id: str
+    agent_type: AgentType
+    title: str
+    content: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    status: Literal["pending", "approved", "rejected"] = "pending"
+    severity: Severity = Severity.INFO
+
+
+class ApprovalGate(BaseModel):
+    """工程师审批门。"""
+    gate_id: str
+    name: str
+    description: str
+    status: NodeStatus = NodeStatus.IDLE
+    report: AgentReport | None = None
+    decision: Literal["approve", "reject", "revise"] | None = None
+    comment: str = ""
+    decided_at: datetime | None = None
+
+
+class AlertItem(BaseModel):
+    """告警项。"""
+    alert_id: str
+    severity: Severity
+    source: str
+    message: str
+    timestamp: datetime
+    acknowledged: bool = False
+
+
+class TimeSeriesPoint(BaseModel):
+    """单个时间序列数据点。"""
+    timestamp: datetime
+    step: int
+    value: float
+
+
+# ---------------------------------------------------------------------------
+# LangGraph 编排状态 (日前调度工作流)
+# ---------------------------------------------------------------------------
+
+class EnergySystemState(TypedDict, total=False):
+    """LangGraph StateGraph 的状态定义。"""
+    run_id: str
+    sim_time: str
+    day: int
+    step: int
+    # 各阶段数据
+    data_agent_result: dict[str, Any]
+    prediction_result: dict[str, Any]
+    storage_result: dict[str, Any]
+    hvac_result: dict[str, Any]
+    monitor_result: dict[str, Any]
+    # 审批门
+    forecast_approval: dict[str, Any]
+    storage_approval: dict[str, Any]
+    hvac_approval: dict[str, Any]
+    # 物理执行
+    physical_dispatch: dict[str, Any]
+    # 事件链
+    events: Annotated[list[dict[str, Any]], _add_events]
+    error: dict[str, Any] | None
+    current_node: str
+    workflow_status: str
+
+
+def _add_events(left: list, right: list | dict) -> list:
+    """events 使用 add reducer 保留完整事件链。"""
+    if isinstance(right, dict):
+        return left + [right]
+    return left + right
+
+
+# ---------------------------------------------------------------------------
+# 实时运行状态 (供前端展示)
+# ---------------------------------------------------------------------------
+
+class RuntimeState(BaseModel):
+    """全局实时运行状态，每个 tick 更新。"""
+    sim_time: datetime
+    day: int
+    step: int
+    progress: float
+    paused: bool
+
+    # Agent 节点状态
+    agent_nodes: dict[str, AgentNodeStatus] = Field(default_factory=dict)
+
+    # 审批门
+    approval_gates: dict[str, ApprovalGate] = Field(default_factory=dict)
+
+    # 实时数据
+    current_load_kw: float = 0.0
+    current_solar_kw: float = 0.0
+    current_grid_kw: float = 0.0
+    current_storage_power_kw: float = 0.0
+    current_storage_soc: float = 0.0
+    current_storage_temp_c: float = 25.0
+    current_hvac_power_kw: float = 0.0
+    current_hvac_chilled_water_temp_c: float = 7.0
+    current_carbon_factor: float = 0.0
+    current_price: float = 0.0
+    current_tariff_period: str = "flat"
+
+    # 告警
+    alerts: list[AlertItem] = Field(default_factory=list)
+
+    # 报告
+    reports: list[AgentReport] = Field(default_factory=list)
+
+    # 日内累计
+    daily_energy_kwh: float = 0.0
+    daily_cost_cny: float = 0.0
+    daily_carbon_kg: float = 0.0
+    daily_peak_kw: float = 0.0
+
+    # 时间序列缓存（当日）
+    load_series: list[dict[str, Any]] = Field(default_factory=list)
+    solar_series: list[dict[str, Any]] = Field(default_factory=list)
+    grid_series: list[dict[str, Any]] = Field(default_factory=list)
+    storage_power_series: list[dict[str, Any]] = Field(default_factory=list)
+    soc_series: list[dict[str, Any]] = Field(default_factory=list)
+    temp_series: list[dict[str, Any]] = Field(default_factory=list)
+    hvac_power_series: list[dict[str, Any]] = Field(default_factory=list)
+    carbon_series: list[dict[str, Any]] = Field(default_factory=list)
+    price_series: list[dict[str, Any]] = Field(default_factory=list)
+
+    # 日前计划曲线
+    day_ahead_load_forecast: list[float] = Field(default_factory=list)
+    day_ahead_storage_plan: list[float] = Field(default_factory=list)
+    day_ahead_hvac_plan: list[float] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 物理约束配置
+# ---------------------------------------------------------------------------
+
+class PhysicsConstraints(BaseModel):
+    """每个 Agent 的物理知识约束（防幻觉/越限）。"""
+    # 储能
+    soc_min: float = 0.10
+    soc_max: float = 0.90
+    temp_max_c: float = 45.0
+    ramp_max_kw: float = 300.0
+    # HVAC
+    chilled_water_min_c: float = 5.0
+    chilled_water_max_c: float = 12.0
+    cop_min: float = 3.0
+    cop_max: float = 5.5
+    # 负荷
+    load_min_kw: float = 5000.0
+    load_max_kw: float = 120000.0
