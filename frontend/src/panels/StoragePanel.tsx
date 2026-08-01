@@ -1,63 +1,31 @@
-﻿import { useAppStore } from '../stores/appStore'
-import { Card, StatusDot } from '../components/Layout'
-import { Battery, Thermometer, Zap, DollarSign } from 'lucide-react'
+import { useState } from 'react'
+import { useAppStore } from '../stores/appStore'
+import { ActionHistory, Card } from '../components/Layout'
+import { Battery, SlidersHorizontal, Zap } from 'lucide-react'
 
 export function StoragePanel() {
-  const { state } = useAppStore()
-  if (!state) return null
-  const ss = state.storage_summary
+  const { state, contextSelection, submitControlAction } = useAppStore()
+  const [power, setPower] = useState('0')
+  const [socFloor, setSocFloor] = useState('15')
+  const [curveFile, setCurveFile] = useState('')
+  const [busy, setBusy] = useState(false)
+  if (!state) return <div className="panel-stack"><p className="empty-copy">等待储能数据</p></div>
   const isCharging = state.storage_power_kw < 0
-
-  return (
-    <div className="p-3 space-y-3">
-      <Card title="实时参数" icon={<Battery className="w-4 h-4 text-green-500" />}>
-        <div className="p-3 space-y-2 text-sm">
-          <Row label="SOC" value={`${(state.storage_soc * 100).toFixed(1)}%`} bar={state.storage_soc * 100} barColor="#22c55e" />
-          <Row label="功率" value={`${Math.abs(state.storage_power_kw).toFixed(0)} kW (${isCharging ? '充电' : '放电'})`} />
-          <Row label="电芯温度" value={`${state.storage_temp_c.toFixed(1)} °C`} bar={state.storage_temp_c / 45 * 100} barColor="#ef4444" />
-          <Row label="状态" value={isCharging ? '充电中' : state.storage_power_kw > 0 ? '放电中' : '待机'} />
-        </div>
-      </Card>
-
-      <Card title="设备参数" icon={<Zap className="w-4 h-4 text-blue-500" />}>
-        <div className="p-3 space-y-2 text-sm">
-          <Row label="额定容量" value="2000 kWh" />
-          <Row label="额定功率" value="500 kW" />
-          <Row label="SOC范围" value="10% - 90%" />
-          <Row label="充放电效率" value="95%" />
-          <Row label="温度上限" value="45 °C" />
-          <Row label="爬坡率" value="300 kW/步" />
-        </div>
-      </Card>
-
-      {ss && (
-        <Card title="调度摘要" icon={<DollarSign className="w-4 h-4 text-amber-500" />}>
-          <div className="p-3 space-y-2 text-sm">
-            <Row label="优化目标" value="最小电费" />
-            <Row label="电费节省" value={`${ss.saving_cny.toFixed(0)} 元`} />
-            <Row label="峰值削减" value={`${ss.peak_reduction_kw.toFixed(0)} kW`} />
-            <Row label="末端SOC" value={`${(ss.terminal_soc * 100).toFixed(1)}%`} />
-            <Row label="最高温度" value={`${ss.max_temp_c.toFixed(1)} °C`} />
-            <Row label="求解器" value={ss.solver_status} />
-          </div>
-        </Card>
-      )}
-    </div>
-  )
+  const submit = async () => {
+    const numericPower = Number(power)
+    const floor = Number(socFloor)
+    if (!Number.isFinite(numericPower) || Math.abs(numericPower) > 500 || !Number.isFinite(floor) || floor < 10 || floor > 90) { window.alert('功率需在 -500～500 kW，SOC 下限需在 10～90%。'); return }
+    if (!window.confirm(`确认下发储能指令？\n目标功率：${numericPower} kW\nSOC 下限：${floor}%`)) return
+    setBusy(true)
+    try {
+      await submitControlAction({ system: 'storage', action: '下发储能指令', target: 'power_kw', value: numericPower, unit: 'kW', reason: `SOC下限=${floor}%${curveFile ? `；参考曲线=${curveFile}` : ''}`, actor: 'engineer' })
+    } catch { /* 409/422/网络错误由 store 转换为明确反馈 */ } finally { setBusy(false) }
+  }
+  return <div className="panel-stack">
+    <Card title={contextSelection?.page === 'storage' ? contextSelection.label : '储能实时参数'} icon={<Battery className="icon-sm industrial" />}><div className="data-list"><Row label="SOC" value={`${(state.storage_soc * 100).toFixed(1)}%`} bar={state.storage_soc * 100} /><Row label="SOH（估算）" value="97.6%" bar={97.6} /><Row label="功率" value={`${Math.abs(state.storage_power_kw).toFixed(0)} kW · ${isCharging ? '充电' : state.storage_power_kw > 0 ? '放电' : '待机'}`} /><Row label="电芯温度" value={`${state.storage_temp_c.toFixed(1)} °C`} bar={state.storage_temp_c / 45 * 100} /><Row label="直流电压（估算）" value="768 V" /><Row label="直流电流（估算）" value={`${Math.abs(state.storage_power_kw / .768).toFixed(0)} A`} /><Row label="当前电价" value={`${state.price.toFixed(4)} 元/kWh`} /></div></Card>
+    {contextSelection?.kind === 'point' && contextSelection.page === 'storage' && <Card title="曲线数据点" icon={<Zap className="icon-sm industrial" />}><div className="data-list">{Object.entries(contextSelection.detail || {}).map(([k, v]) => <div className="data-row" key={k}><span>{k}</span><strong>{String(v)}</strong></div>)}</div></Card>}
+    <Card title="人工调度" icon={<SlidersHorizontal className="icon-sm industrial" />}><div className="form-grid"><label>目标功率（kW，正值放电）<input type="number" min="-500" max="500" value={power} onChange={e => setPower(e.target.value)} /></label><label>SOC 安全下限（%）<input type="number" min="10" max="90" value={socFloor} onChange={e => setSocFloor(e.target.value)} /></label><label>上传 96 点目标曲线<input type="file" accept=".csv,.xlsx" onChange={e => setCurveFile(e.target.files?.[0]?.name || '')} />{curveFile && <small>已选择：{curveFile}</small>}</label><button disabled={busy} className="btn primary" onClick={submit}>{busy ? '提交中…' : '确认并下发'}</button></div></Card>
+    <ActionHistory />
+  </div>
 }
-
-function Row({ label, value, bar, barColor }: { label: string; value: string; bar?: number; barColor?: string }) {
-  return (
-    <div>
-      <div className="flex items-center justify-between">
-        <span className="text-slate-500">{label}</span>
-        <span className="font-medium text-slate-700">{value}</span>
-      </div>
-      {bar !== undefined && (
-        <div className="mt-1 h-1.5 rounded-full bg-slate-100 overflow-hidden">
-          <div className="h-full rounded-full" style={{ width: `${Math.min(100, Math.max(0, bar))}%`, backgroundColor: barColor || '#3b82f6' }} />
-        </div>
-      )}
-    </div>
-  )
-}
+function Row({ label, value, bar }: { label: string; value: string; bar?: number }) { return <div><div className="data-row"><span>{label}</span><strong>{value}</strong></div>{bar !== undefined && <div className="bar"><i style={{ width: `${Math.max(0, Math.min(100, bar))}%` }} /></div>}</div> }

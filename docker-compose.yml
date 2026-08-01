@@ -1,0 +1,15 @@
+services:
+  energy-management:
+    build:
+      context: .
+    ports:
+      - "8000:8000"
+    environment:
+      ENERGY_CORS_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000"
+      ENERGY_AUTO_APPROVE: "false"
+    volumes:
+      - energy-archive:/app/backend/data/archive
+    restart: unless-stopped
+
+volumes:
+  energy-archive:

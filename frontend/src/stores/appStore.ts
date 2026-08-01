@@ -1,8 +1,16 @@
-﻿/** Zustand 全局状态管理：WebSocket 实时同步 + API 操作。 */
+/** Zustand 全局状态管理：WebSocket 实时同步 + API 操作。 */
 import { create } from 'zustand'
-import type { RuntimeState, GraphTopology } from '../types'
+import type { ActionRecord, ContextSelection, ControlActionPayload, ControlActionRecord, RuntimeState, GraphTopology } from '../types'
 
 const API_BASE = import.meta.env.DEV ? 'http://127.0.0.1:8000' : ''
+const ACTION_STORAGE_KEY = 'huanghua-energy-action-records'
+
+function loadActionRecords(): ActionRecord[] {
+  try {
+    const value = window.localStorage.getItem(ACTION_STORAGE_KEY)
+    return value ? (JSON.parse(value) as ActionRecord[]).slice(0, 30) : []
+  } catch { return [] }
+}
 
 interface AppStore {
   state: RuntimeState | null
@@ -10,14 +18,27 @@ interface AppStore {
   activePage: string
   rightPanelCollapsed: boolean
   selectedNodeId: string | null
+  contextSelection: ContextSelection | null
+  selectedReportId: string | null
   wsConnected: boolean
+  connectionState: 'connecting' | 'connected' | 'reconnecting' | 'offline'
+  loadState: 'idle' | 'loading' | 'ready' | 'error'
+  errorMessage: string | null
+  actionRecords: ActionRecord[]
+  controlActions: ControlActionRecord[]
+  operationMessage: { kind: 'success' | 'error'; text: string } | null
 
   setActivePage: (page: string) => void
   toggleRightPanel: () => void
   setSelectedNode: (id: string | null) => void
+  setContextSelection: (selection: ContextSelection | null) => void
+  setSelectedReport: (id: string | null) => void
   setState: (s: RuntimeState) => void
   setGraph: (g: GraphTopology) => void
   setWsConnected: (v: boolean) => void
+  setConnectionState: (v: AppStore['connectionState']) => void
+  recordAction: (action: string, target: string, result: ActionRecord['result'], detail?: string) => void
+  clearOperationMessage: () => void
 
   fetchState: () => Promise<void>
   fetchGraph: () => Promise<void>
@@ -26,36 +47,59 @@ interface AppStore {
   reset: () => Promise<void>
   approve: (gateId: string, decision: string, comment?: string) => Promise<void>
   acknowledgeAlert: (alertId: string) => Promise<void>
+  submitControlAction: (payload: ControlActionPayload) => Promise<ControlActionRecord>
+  fetchControlActions: () => Promise<void>
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
   state: null,
   graph: null,
   activePage: 'overview',
-  rightPanelCollapsed: false,
+  rightPanelCollapsed: typeof window !== 'undefined' && window.innerWidth < 1200,
   selectedNodeId: null,
+  contextSelection: null,
+  selectedReportId: null,
   wsConnected: false,
+  connectionState: 'connecting',
+  loadState: 'idle',
+  errorMessage: null,
+  actionRecords: loadActionRecords(),
+  controlActions: [],
+  operationMessage: null,
 
-  setActivePage: (page) => set({ activePage: page }),
+  setActivePage: (page) => set({ activePage: page, contextSelection: null, selectedReportId: null, rightPanelCollapsed: typeof window !== 'undefined' && window.innerWidth < 1200 ? true : get().rightPanelCollapsed }),
   toggleRightPanel: () => set((s) => ({ rightPanelCollapsed: !s.rightPanelCollapsed })),
   setSelectedNode: (id) => set({ selectedNodeId: id }),
+  setContextSelection: (selection) => set({ contextSelection: selection, rightPanelCollapsed: selection && typeof window !== 'undefined' && window.innerWidth < 1200 ? false : get().rightPanelCollapsed }),
+  setSelectedReport: (id) => set({ selectedReportId: id }),
   setState: (s) => set({ state: s }),
   setGraph: (g) => set({ graph: g }),
   setWsConnected: (v) => set({ wsConnected: v }),
+  setConnectionState: (v) => set({ connectionState: v, wsConnected: v === 'connected' }),
+  recordAction: (action, target, result, detail) => set((s) => {
+    const actionRecords = [{ id: crypto.randomUUID(), at: new Date().toISOString(), action, target, result, detail }, ...s.actionRecords].slice(0, 30)
+    try { window.localStorage.setItem(ACTION_STORAGE_KEY, JSON.stringify(actionRecords)) } catch { /* 浏览器禁用存储时仍保留本次会话 */ }
+    return { actionRecords, operationMessage: { kind: result === 'success' ? 'success' : 'error', text: `${action}：${result === 'success' ? '已完成' : '失败'}${detail ? ` · ${detail}` : ''}` } }
+  }),
+  clearOperationMessage: () => set({ operationMessage: null }),
 
   fetchState: async () => {
+    if (get().loadState === 'idle') set({ loadState: 'loading', errorMessage: null })
     try {
       const res = await fetch(`${API_BASE}/api/state`)
+      if (!res.ok) throw new Error(`状态接口返回 ${res.status}`)
       const data = await res.json()
-      set({ state: data })
+      set({ state: data, loadState: 'ready', errorMessage: null })
     } catch (e) {
       console.error('fetchState error', e)
+      if (!get().state) set({ loadState: 'error', errorMessage: e instanceof Error ? e.message : '无法获取系统状态' })
     }
   },
 
   fetchGraph: async () => {
     try {
       const res = await fetch(`${API_BASE}/api/graph`)
+      if (!res.ok) throw new Error(`拓扑接口返回 ${res.status}`)
       const data = await res.json()
       set({ graph: data })
     } catch (e) {
@@ -64,36 +108,109 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   pause: async () => {
-    await fetch(`${API_BASE}/api/time/pause`, { method: 'POST' })
+    try {
+      const res = await fetch(`${API_BASE}/api/time/pause`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      get().recordAction('暂停仿真', '200× 时间引擎', 'success')
+      await get().fetchState()
+    } catch (e) { get().recordAction('暂停仿真', '200× 时间引擎', 'failed', e instanceof Error ? e.message : '请求失败') }
   },
   resume: async () => {
-    await fetch(`${API_BASE}/api/time/resume`, { method: 'POST' })
+    try {
+      const res = await fetch(`${API_BASE}/api/time/resume`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      get().recordAction('继续仿真', '200× 时间引擎', 'success')
+      await get().fetchState()
+    } catch (e) { get().recordAction('继续仿真', '200× 时间引擎', 'failed', e instanceof Error ? e.message : '请求失败') }
   },
   reset: async () => {
-    await fetch(`${API_BASE}/api/time/reset`, { method: 'POST' })
+    try {
+      const res = await fetch(`${API_BASE}/api/time/reset`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      get().recordAction('重置仿真', '200× 时间引擎', 'success')
+      await get().fetchState()
+    } catch (e) { get().recordAction('重置仿真', '200× 时间引擎', 'failed', e instanceof Error ? e.message : '请求失败') }
   },
   approve: async (gateId, decision, comment = '') => {
-    await fetch(`${API_BASE}/api/approval/${gateId}?decision=${decision}&comment=${encodeURIComponent(comment)}`, { method: 'POST' })
+    try {
+      const params = new URLSearchParams({ decision, comment })
+      const res = await fetch(`${API_BASE}/api/approval/${gateId}?${params}`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      get().recordAction(decision === 'approve' ? '批准报告' : '退回修改', gateId, 'success', comment || undefined)
+      await get().fetchState()
+    } catch (e) {
+      get().recordAction(decision === 'approve' ? '批准报告' : '退回修改', gateId, 'failed', e instanceof Error ? e.message : '请求失败')
+      throw e
+    }
   },
   acknowledgeAlert: async (alertId) => {
-    await fetch(`${API_BASE}/api/alerts/${alertId}/acknowledge`, { method: 'POST' })
+    try {
+      const res = await fetch(`${API_BASE}/api/alerts/${alertId}/acknowledge`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      get().recordAction('确认告警', alertId, 'success')
+      await get().fetchState()
+    } catch (e) {
+      get().recordAction('确认告警', alertId, 'failed', e instanceof Error ? e.message : '请求失败')
+      throw e
+    }
+  },
+  fetchControlActions: async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/control-actions?limit=30`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      set({ controlActions: await res.json() })
+    } catch (e) {
+      console.error('fetchControlActions error', e)
+    }
+  },
+  submitControlAction: async (payload) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/control-actions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        const detail = typeof body.detail === 'string' ? body.detail : `控制接口返回 ${res.status}`
+        throw new Error(res.status === 409 ? `审批尚未满足：${detail}` : detail)
+      }
+      const record = body as ControlActionRecord
+      set((s) => ({
+        controlActions: [record, ...s.controlActions.filter(item => item.action_id !== record.action_id)].slice(0, 30),
+        operationMessage: { kind: 'success', text: `${payload.action}：${record.status === 'executed' ? '已执行' : '已受理，将在下一仿真步执行'}` },
+      }))
+      await get().fetchControlActions()
+      return record
+    } catch (e) {
+      const message = e instanceof Error ? e.message : '控制请求失败'
+      get().recordAction(payload.action, payload.target, 'failed', message)
+      throw e
+    }
   },
 }))
 
 let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let allowReconnect = false
+let reconnectAttempts = 0
 
 export function connectWebSocket() {
+  allowReconnect = true
   const wsUrl = import.meta.env.DEV
     ? 'ws://127.0.0.1:8000/ws'
     : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
 
   const connect = () => {
+    if (!allowReconnect) return
+    useAppStore.getState().setConnectionState(reconnectAttempts ? 'reconnecting' : 'connecting')
     ws = new WebSocket(wsUrl)
     const store = useAppStore
 
     ws.onopen = () => {
       store.getState().setWsConnected(true)
+      store.getState().setConnectionState('connected')
+      reconnectAttempts = 0
     }
 
     ws.onmessage = (event) => {
@@ -109,7 +226,10 @@ export function connectWebSocket() {
 
     ws.onclose = () => {
       store.getState().setWsConnected(false)
-      reconnectTimer = setTimeout(connect, 2000)
+      if (!allowReconnect) return
+      reconnectAttempts += 1
+      store.getState().setConnectionState(reconnectAttempts >= 5 ? 'offline' : 'reconnecting')
+      reconnectTimer = setTimeout(connect, Math.min(15000, 1000 * 2 ** Math.min(reconnectAttempts, 4)))
     }
 
     ws.onerror = () => {
@@ -121,7 +241,12 @@ export function connectWebSocket() {
 }
 
 export function disconnectWebSocket() {
+  allowReconnect = false
   if (reconnectTimer) clearTimeout(reconnectTimer)
-  ws?.close()
+  if (ws) {
+    ws.onclose = null
+    ws.onerror = null
+    ws.close()
+  }
   ws = null
 }

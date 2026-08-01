@@ -29,21 +29,39 @@ def compute_carbon_factors(
     purchase_f = ef["purchase"]
 
     c_factors = []
+    conservation_weights = []
+    known_generation_ratios = []
     for gm in generation_mix:
-        total = gm.get("total", 0)
+        coal = max(0.0, gm.get("coal", 0))
+        hydro = max(0.0, gm.get("hydro", 0))
+        wind = max(0.0, gm.get("wind", 0))
+        solar = max(0.0, gm.get("solar", 0))
+        known = coal + hydro + wind + solar
+        total = max(float(gm.get("total", 0)), known)
         if total <= _EPS:
             c_factors.append(purchase_f)
+            conservation_weights.append(1.0)
+            known_generation_ratios.append(0.0)
             continue
+        residual = max(0.0, float(gm.get("other", 0)), total - known)
         weighted = (
-            gm.get("coal", 0) * ef["coal"]
-            + gm.get("hydro", 0) * ef["hydro"]
-            + gm.get("wind", 0) * ef["wind"]
-            + gm.get("solar", 0) * ef["solar"]
+            coal * ef["coal"]
+            + hydro * ef["hydro"]
+            + wind * ef["wind"]
+            + solar * ef["solar"]
+            + residual * purchase_f
         )
         c_factors.append(weighted / total)
+        conservation_weights.append(total)
+        known_generation_ratios.append(min(1.0, known / total))
 
     # 江亿 Cr(τ)
-    c_bar = sum(c_factors) / len(c_factors) if c_factors else 0.0
+    weight_sum = sum(conservation_weights)
+    c_bar = (
+        sum(c * weight for c, weight in zip(c_factors, conservation_weights, strict=True)) / weight_sum
+        if c_factors and weight_sum > _EPS
+        else 0.0
+    )
     denom = max(c_bar, _EPS)
 
     cr_factors = []
@@ -55,7 +73,10 @@ def compute_carbon_factors(
 
     # 守恒归一化：mean(Cr) = mean(C) = C̄
     if cr_factors:
-        cr_mean = sum(cr_factors) / len(cr_factors)
+        cr_mean = sum(
+            cr * weight
+            for cr, weight in zip(cr_factors, conservation_weights, strict=True)
+        ) / max(weight_sum, _EPS)
         if cr_mean > _EPS:
             scale = c_bar / cr_mean
             cr_factors = [cr * scale for cr in cr_factors]
@@ -69,7 +90,18 @@ def compute_carbon_factors(
         "cr_factors": cr_factors,
         "ratios": ratios,
         "c_mean": round(c_bar, 6),
-        "cr_mean": round(sum(cr_factors) / len(cr_factors) if cr_factors else 0, 6),
+        "cr_mean": round(
+            sum(cr * weight for cr, weight in zip(cr_factors, conservation_weights, strict=True))
+            / max(weight_sum, _EPS)
+            if cr_factors else 0,
+            6,
+        ),
+        "known_generation_ratio_mean": round(
+            sum(known_generation_ratios) / len(known_generation_ratios)
+            if known_generation_ratios else 0.0,
+            4,
+        ),
+        "residual_factor_assumption": "unclassified generation uses purchase factor",
     }
 
 

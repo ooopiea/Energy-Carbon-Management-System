@@ -1,4 +1,4 @@
-﻿import { useEffect } from 'react'
+import { useEffect } from 'react'
 import { useAppStore, connectWebSocket, disconnectWebSocket } from './stores/appStore'
 import { Layout } from './components/Layout'
 import { Overview } from './pages/Overview'
@@ -7,13 +7,14 @@ import { StoragePage } from './pages/StoragePage'
 import { HVACPage } from './pages/HVACPage'
 
 export default function App() {
-  const { activePage, fetchState, fetchGraph } = useAppStore()
+  const { activePage, fetchState, fetchGraph, fetchControlActions } = useAppStore()
 
   useEffect(() => {
     fetchState()
     fetchGraph()
+    fetchControlActions()
     connectWebSocket()
-    const interval = setInterval(() => fetchState(), 5000)
+    const interval = setInterval(() => { fetchState(); fetchControlActions() }, 5000)
     return () => {
       clearInterval(interval)
       disconnectWebSocket()

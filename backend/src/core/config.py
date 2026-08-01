@@ -1,7 +1,9 @@
 """全局配置：站点参数、时间引擎、Agent 默认值。"""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # backend/
@@ -9,11 +11,25 @@ DATA_DIR = BASE_DIR / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 SIMULATED_DIR = DATA_DIR / "simulated"
 AGENTS_CONFIG_DIR = BASE_DIR / "agents_config"
+BUNDLED_RAW_DIR = DATA_DIR / "raw"
+LEGACY_RAW_DIR = BASE_DIR.parent.parent / "data_raw"
+DATA_RAW_DIR = Path(
+    os.getenv(
+        "ENERGY_DATA_RAW_DIR",
+        str(BUNDLED_RAW_DIR if BUNDLED_RAW_DIR.exists() else LEGACY_RAW_DIR),
+    )
+)
 
 # 站点：长沙黄花园区
 SITE_ID = "huanghua"
 SITE_NAME = "黄花工业园区"
 REGION = "cn-hunan"
+SIMULATION_START_DATE = date(2025, 7, 15)
+
+# 项目参考文件确认的站点资产容量。单位口径必须在全链路保持一致。
+SITE_SOLAR_CAPACITY_KW = 19_100.0
+SITE_STORAGE_POWER_KW = 15_000.0
+SITE_STORAGE_CAPACITY_KWH = 30_000.0
 
 # 时间引擎：200x 现实速度，15min 模拟粒度
 TIME_SCALE = 200
@@ -22,23 +38,26 @@ POINTS_PER_DAY = 96  # 24h * 4
 
 # 物理约束默认值
 STORAGE_DEFAULTS = {
-    "capacity_kwh": 2000.0,
-    "max_charge_power_kw": 500.0,
-    "max_discharge_power_kw": 500.0,
+    "capacity_kwh": SITE_STORAGE_CAPACITY_KWH,
+    "max_charge_power_kw": SITE_STORAGE_POWER_KW,
+    "max_discharge_power_kw": SITE_STORAGE_POWER_KW,
     "min_soc_ratio": 0.10,
     "max_soc_ratio": 0.90,
     "charge_efficiency_ratio": 0.95,
     "discharge_efficiency_ratio": 0.95,
-    "max_ramp_kw_per_step": 300.0,
+    "max_ramp_kw_per_step": SITE_STORAGE_POWER_KW,
     "max_cell_temperature_c": 45.0,
-    "thermal_resistance_c_per_kw": 0.002,
+    # 工程回退值：额定功率时稳态温升约 8°C；上线前应由 BMS 实测标定。
+    "thermal_resistance_c_per_kw": 8.0 / SITE_STORAGE_POWER_KW,
     "thermal_time_constant_min": 30.0,
     "ambient_temperature_c": 25.0,
+    "max_equivalent_full_cycles": 1.5,
 }
 
 HVAC_DEFAULTS = {
-    "chiller_count": 20,
-    "total_rated_power_kw": 180000,
+    "chiller_count": 37,
+    # 原始台账数值外形对应制冷量而非电输入功率，暂按额定制冷量使用。
+    "total_rated_cooling_kw": 256708.0,
     "chilled_water_temp_setpoint_c": 7.0,
     "return_water_temp_max_c": 12.0,
     "cop_nominal": 4.5,
@@ -46,7 +65,8 @@ HVAC_DEFAULTS = {
 }
 
 COMPRESSOR_DEFAULTS = {
-    "total_rated_power_kw": 25900,
+    "unit_count": 38,
+    "total_rated_power_kw": 27600,
     "min_load_ratio": 0.3,
     "max_load_ratio": 1.0,
 }
@@ -72,10 +92,12 @@ EMISSION_FACTORS = {
 # 尖峰(夏季7-8月): 20:00-24:00
 
 TARIFF_PRICES = {
-    "sharp": 0.81518,   # 尖 (元/kWh)
-    "peak": 0.67932,    # 峰
-    "flat": 0.42457,    # 平
-    "valley": 0.16983,  # 谷
+    # 2026-01 黄花底稿“合计单价”，用于找不到目标月份账单时的代理值。
+    # 政府性基金与基本电费仍在 tariff.py 中单列核算。
+    "sharp": 1.11022,   # 尖 (元/kWh)
+    "peak": 0.93098,    # 峰
+    "flat": 0.59490,    # 平
+    "valley": 0.25881,  # 谷
 }
 
 DEMAND_PRICE_CNY_PER_KW_MONTH = 30.6
@@ -102,16 +124,20 @@ def get_tariff_period(hour: float, month: int = 7) -> str:
     return "peak"
 
 
-def build_period_map() -> list[str]:
+def build_period_map(month: int = 7) -> list[str]:
     """生成 96 点时段标签序列。"""
     labels = []
     for i in range(POINTS_PER_DAY):
         hour = i * SIM_STEP_MINUTES / 60.0
-        labels.append(get_tariff_period(hour))
+        labels.append(get_tariff_period(hour, month))
     return labels
 
 
-def build_price_series() -> list[float]:
+def build_price_series(
+    month: int = 7,
+    prices: dict[str, float] | None = None,
+) -> list[float]:
     """生成 96 点电价序列。"""
-    period_map = build_period_map()
-    return [TARIFF_PRICES[p] for p in period_map]
+    period_map = build_period_map(month)
+    rate_map = prices or TARIFF_PRICES
+    return [float(rate_map[p]) for p in period_map]

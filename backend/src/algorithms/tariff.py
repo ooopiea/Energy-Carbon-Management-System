@@ -16,6 +16,7 @@ def calculate_tariff(
     price_cny_per_kwh: list[float],
     step_minutes: int = 15,
     declared_demand_kw: float | None = None,
+    billing_days: float = 30.0,
 ) -> dict:
     """计算电费。
 
@@ -26,6 +27,12 @@ def calculate_tariff(
     - 力调电费 = (电度+需量) × reactive_adjust_ratio
     """
     n = len(grid_import_kw)
+    if n == 0 or len(price_cny_per_kwh) != n:
+        raise ValueError("grid_import_kw and price_cny_per_kwh must be non-empty and equal length")
+    if step_minutes <= 0 or billing_days <= 0:
+        raise ValueError("step_minutes and billing_days must be positive")
+    if any(float(power) < 0 for power in grid_import_kw):
+        raise ValueError("grid_import_kw cannot be negative; export must be accounted separately")
     dt_hours = step_minutes / 60.0
 
     energy_cost = 0.0
@@ -37,7 +44,10 @@ def calculate_tariff(
 
     peak_demand = max((float(p) for p in grid_import_kw), default=0.0)
     effective_demand = max(peak_demand, declared_demand_kw or 0.0)
-    demand_cost = effective_demand * DEMAND_PRICE_CNY_PER_KW_MONTH
+    monthly_demand_cost = effective_demand * DEMAND_PRICE_CNY_PER_KW_MONTH
+    horizon_days = n * step_minutes / (24 * 60)
+    demand_allocation_ratio = min(1.0, horizon_days / billing_days)
+    demand_cost = monthly_demand_cost * demand_allocation_ratio
 
     gov_fund_cost = total_kwh * GOV_FUND_RATE
     reactive_adjustment = (energy_cost + demand_cost) * REACTIVE_ADJUST_RATIO
@@ -48,10 +58,13 @@ def calculate_tariff(
     return {
         "energy_cost_cny": round(energy_cost, 2),
         "demand_cost_cny": round(demand_cost, 2),
+        "monthly_demand_cost_cny": round(monthly_demand_cost, 2),
+        "demand_allocation_ratio": round(demand_allocation_ratio, 6),
         "gov_fund_cost_cny": round(gov_fund_cost, 2),
         "reactive_adjustment_cny": round(reactive_adjustment, 2),
         "total_cost_cny": round(total_cost, 2),
         "total_kwh": round(total_kwh, 1),
         "peak_demand_kw": round(peak_demand, 1),
         "effective_price_cny_per_kwh": round(effective_price, 6),
+        "billing_scope": "horizon variable costs plus prorated monthly demand charge",
     }

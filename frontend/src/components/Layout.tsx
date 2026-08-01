@@ -1,8 +1,8 @@
-﻿import { type ReactNode } from 'react'
+import { type ReactNode, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import {
-  Workflow, LayoutDashboard, BatteryCharging, Wind,
-  Pause, Play, RotateCcw, Wifi, WifiOff, ChevronRight, Zap, AlertTriangle, FileText, CheckCircle2, Clock, XCircle
+  Workflow, LayoutDashboard, BatteryCharging, Wind, Pause, Play, RotateCcw,
+  Wifi, WifiOff, PanelRightClose, PanelRightOpen, Zap, CheckCircle2, XCircle,
 } from 'lucide-react'
 import { OverviewPanel } from '../panels/OverviewPanel'
 import { AgentFlowPanel } from '../panels/AgentFlowPanel'
@@ -18,78 +18,103 @@ const NAV_ITEMS = [
 
 export function statusColor(status: string): string {
   switch (status) {
-    case 'completed': case 'approved': return '#22c55e'
-    case 'running': return '#3b82f6'
-    case 'pending_approval': case 'warning': return '#f59e0b'
-    case 'failed': case 'rejected': case 'critical': return '#ef4444'
-    default: return '#9ca3af'
+    case 'completed': case 'approved': return '#15803d'
+    case 'running': return '#176b87'
+    case 'pending_approval': case 'warning': return '#d97706'
+    case 'failed': case 'rejected': case 'critical': return '#dc2626'
+    default: return '#94a3b8'
   }
 }
 
 export function statusLabel(status: string): string {
   const map: Record<string, string> = {
-    idle: '未开始', running: '运行中', completed: '已完成',
-    pending_approval: '等待审批', approved: '已批准',
-    rejected: '已退回', failed: '异常', warning: '告警',
+    idle: '未开始', running: '运行中', completed: '已完成', pending_approval: '等待审批',
+    approved: '已批准', rejected: '已退回', failed: '异常', warning: '告警', critical: '严重',
   }
   return map[status] || status
 }
 
 export function StatusDot({ status }: { status: string }) {
-  return (
-    <span
-      className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
-      style={{ backgroundColor: statusColor(status) }}
-    />
-  )
+  return <span className="status-dot" style={{ backgroundColor: statusColor(status) }} aria-label={statusLabel(status)} />
 }
 
 export function Card({ children, className = '', title, icon }: { children: ReactNode; className?: string; title?: string; icon?: ReactNode }) {
   return (
-    <div className={`bg-white rounded-lg border border-slate-200 shadow-sm ${className}`}>
-      {title && (
-        <div className="flex items-center gap-2 px-4 py-3 border-b border-slate-100">
-          {icon}
-          <h3 className="text-sm font-semibold text-slate-700">{title}</h3>
-        </div>
-      )}
+    <section className={`surface-card ${className}`}>
+      {title && <header className="card-header">{icon}<h3>{title}</h3></header>}
       {children}
-    </div>
+    </section>
   )
 }
 
-export function KpiCard({ label, value, unit, color = '#3b82f6', icon }: { label: string; value: string | number; unit?: string; color?: string; icon?: ReactNode }) {
+export function KpiCard({ label, value, unit, color = '#176b87', icon }: { label: string; value: string | number; unit?: string; color?: string; icon?: ReactNode }) {
   return (
-    <div className="bg-white rounded-lg border border-slate-200 p-3 shadow-sm">
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-xs text-slate-500">{label}</span>
-        {icon}
-      </div>
-      <div className="flex items-baseline gap-1">
-        <span className="text-xl font-bold" style={{ color }}>{value}</span>
-        {unit && <span className="text-xs text-slate-400">{unit}</span>}
-      </div>
-    </div>
+    <article className="kpi-card">
+      <div className="kpi-label"><span>{label}</span>{icon}</div>
+      <div className="kpi-value" style={{ color }}>{value}{unit && <span>{unit}</span>}</div>
+    </article>
   )
 }
 
 function formatTime(timeStr: string): string {
-  try {
-    const d = new Date(timeStr)
-    return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  } catch {
-    return timeStr
-  }
+  const d = new Date(timeStr)
+  return Number.isNaN(d.getTime()) ? timeStr : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function DispatchRail() {
+  const state = useAppStore(s => s.state)
+  const step = Math.max(0, Math.min(95, state?.time.step ?? 0))
+  const prices = state?.day_ahead.price ?? []
+  const max = Math.max(...prices, 1)
+  return (
+    <div className="dispatch-rail" aria-label={`96点调度轨，当前第 ${step + 1} 点`}>
+      <div className="rail-meta">
+        <div><span className="eyebrow">黄花园区 · 200× 仿真</span><strong>{state ? formatTime(state.time.sim_time) : '等待系统时间'}</strong></div>
+        <div className="rail-step"><span>当前步</span><strong>{String(step + 1).padStart(2, '0')}</strong><small>/ 96</small></div>
+      </div>
+      <div className="rail-track" role="img" aria-label="全天分时电价与当前仿真位置">
+        {Array.from({ length: 96 }, (_, i) => {
+          const price = prices[i] ?? 0
+          const level = price / max > .8 ? 'sharp' : price / max > .55 ? 'peak' : price / max < .35 ? 'valley' : 'flat'
+          return <span key={i} className={`${level} ${i === step ? 'current' : ''}`} title={`${String(Math.floor(i / 4)).padStart(2, '0')}:${String(i % 4 * 15).padStart(2, '0')} · ${price.toFixed(3)} 元/kWh`} />
+        })}
+      </div>
+      <div className="rail-legend"><span><i className="valley" />谷</span><span><i className="flat" />平</span><span><i className="peak" />峰</span><span><i className="sharp" />尖</span></div>
+    </div>
+  )
+}
+
+export function ActionHistory({ limit = 5 }: { limit?: number }) {
+  const localRecords = useAppStore(s => s.actionRecords).filter(r => r.result === 'failed' || !['应用园区策略', '撤销园区策略', '下发储能指令', '下发 HVAC 设定'].includes(r.action))
+  const serverRecords = useAppStore(s => s.controlActions)
+  const records = [
+    ...serverRecords.map(r => ({ id: r.action_id, at: r.submitted_at, action: r.action, target: r.target, result: r.status === 'rejected' ? 'failed' as const : 'success' as const, detail: `${r.value} ${r.unit} · ${r.status === 'executed' ? `已执行${r.applied_step === null ? '' : `（步 ${r.applied_step}）`}` : r.status === 'accepted' ? '已受理，等待下一步执行' : '已拒绝'}${r.reason ? ` · ${r.reason}` : ''}` })),
+    ...localRecords,
+  ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime()).slice(0, limit)
+  return (
+    <Card title="操作记录" icon={<Workflow className="icon-sm industrial" />}>
+      <div className="history-list">
+        {records.length === 0 && <p className="empty-copy">尚无人工操作</p>}
+        {records.map(r => <div className="history-item" key={r.id}>
+          {r.result === 'success' ? <CheckCircle2 className="icon-sm ok" /> : <XCircle className="icon-sm danger" />}
+          <div><strong>{r.action}</strong><span>{r.target} · {new Date(r.at).toLocaleTimeString('zh-CN')}</span>{r.detail && <small>{r.detail}</small>}</div>
+        </div>)}
+      </div>
+    </Card>
+  )
 }
 
 export function Layout({ children }: { children: ReactNode }) {
-  const {
-    activePage, setActivePage, rightPanelCollapsed, toggleRightPanel,
-    state, wsConnected, pause, resume, reset,
-  } = useAppStore()
-
-  const time = state?.time
-  const isPaused = time?.paused ?? false
+  const { activePage, setActivePage, rightPanelCollapsed, toggleRightPanel, state, connectionState, pause, resume, reset, loadState, errorMessage, fetchState, operationMessage, clearOperationMessage } = useAppStore()
+  const isPaused = state?.time.paused ?? false
+  useEffect(() => {
+    if (!operationMessage) return
+    const timer = window.setTimeout(clearOperationMessage, 4000)
+    return () => window.clearTimeout(timer)
+  }, [operationMessage, clearOperationMessage])
+  useEffect(() => {
+    if (window.matchMedia('(max-width: 1199px)').matches) useAppStore.setState({ rightPanelCollapsed: true })
+  }, [])
 
   const renderRightPanel = () => {
     switch (activePage) {
@@ -100,91 +125,45 @@ export function Layout({ children }: { children: ReactNode }) {
     }
   }
 
+  const resetWithConfirm = () => {
+    if (window.confirm('确认将 200× 仿真时间重置到起点？该操作会改变当前运行进度。')) reset()
+  }
+
   return (
-    <div className="flex h-screen bg-slate-50 overflow-hidden">
-      {/* 左侧导航栏 */}
-      <div className="w-52 bg-slate-800 flex flex-col flex-shrink-0">
-        <div className="px-4 py-4 flex items-center gap-2 border-b border-slate-700">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-400 flex items-center justify-center">
-            <Zap className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <div className="text-white text-sm font-bold leading-tight">能源管理</div>
-            <div className="text-slate-400 text-[10px]">V3 Agent Platform</div>
+    <div className={`app-shell ${rightPanelCollapsed ? 'panel-is-collapsed' : ''}`}>
+      <aside className="sidebar" aria-label="主导航">
+        <div className="brand"><div className="brand-mark"><Zap /></div><div className="brand-copy"><strong>黄花园区</strong><span>调度控制台</span></div></div>
+        <nav>{NAV_ITEMS.map(item => { const Icon = item.icon; const active = activePage === item.id; return (
+          <button key={item.id} onClick={() => setActivePage(item.id)} className={active ? 'active' : ''} aria-current={active ? 'page' : undefined} title={item.label}>
+            <Icon /><span>{item.label}</span>
+          </button>
+        ) })}</nav>
+        <div className="time-controls">
+          <span className="connection"><i className={connectionState} />{connectionState === 'connected' ? <Wifi /> : <WifiOff />}<b>{connectionState === 'connected' ? '实时连接' : connectionState === 'reconnecting' ? '正在重连' : connectionState === 'connecting' ? '正在连接' : '连接中断'}</b></span>
+          <div className="control-row">
+            <button onClick={() => isPaused ? resume() : pause()} aria-label={isPaused ? '继续仿真' : '暂停仿真'}>{isPaused ? <Play /> : <Pause />}<span>{isPaused ? '继续' : '暂停'}</span></button>
+            <button onClick={resetWithConfirm} aria-label="重置仿真"><RotateCcw /></button>
           </div>
         </div>
+      </aside>
 
-        <nav className="flex-1 py-2">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon
-            const active = activePage === item.id
-            return (
-              <button
-                key={item.id}
-                onClick={() => setActivePage(item.id)}
-                className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
-                  active
-                    ? 'bg-blue-600 text-white border-r-2 border-blue-400'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <Icon className="w-4 h-4 flex-shrink-0" />
-                <span>{item.label}</span>
-              </button>
-            )
-          })}
-        </nav>
+      <main className="main-workspace">
+        <DispatchRail />
+        {connectionState !== 'connected' && state && <div className="state-banner warning" role="status">实时连接暂不可用，正在展示最近一次成功数据。系统会自动重连。</div>}
+        {loadState === 'loading' && <div className="page-state" role="status"><span className="spinner" />正在接入园区实时数据…</div>}
+        {loadState === 'error' && !state && <div className="page-state error" role="alert"><strong>无法加载能源系统</strong><span>{errorMessage}</span><button onClick={fetchState}>重新连接</button></div>}
+        {(state || loadState === 'idle') && <div className="page-content">{children}</div>}
+      </main>
 
-        {/* 时间显示与控制 */}
-        {time && (
-          <div className="px-3 py-3 border-t border-slate-700 space-y-2">
-            <div className="text-slate-400 text-[10px]">模拟时间 ({time.time_scale}x)</div>
-            <div className="text-white text-sm font-mono">{formatTime(time.sim_time)}</div>
-            <div className="text-slate-500 text-[10px]">第 {time.day + 1} 天 | 步 {time.step}/96 | {Math.round(time.progress * 100)}%</div>
-            <div className="flex items-center gap-1.5">
-              <button
-                onClick={() => isPaused ? resume() : pause()}
-                className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs"
-              >
-                {isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
-                {isPaused ? '继续' : '暂停'}
-              </button>
-              <button
-                onClick={() => reset()}
-                className="px-2 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200"
-              >
-                <RotateCcw className="w-3 h-3" />
-              </button>
-            </div>
-            <div className="flex items-center gap-1 text-[10px]">
-              {wsConnected ? (
-                <><Wifi className="w-3 h-3 text-green-400" /><span className="text-green-400">已连接</span></>
-              ) : (
-                <><WifiOff className="w-3 h-3 text-red-400" /><span className="text-red-400">未连接</span></>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* 中央主工作区 */}
-      <div className="flex-1 overflow-y-auto p-4">
-        {children}
-      </div>
-
-      {/* 右侧上下文面板 */}
-      {!rightPanelCollapsed && (
-        <div className="w-80 bg-white border-l border-slate-200 overflow-y-auto flex-shrink-0">
-          {renderRightPanel()}
-        </div>
-      )}
-      <button
-        onClick={toggleRightPanel}
-        className="absolute right-0 top-1/2 -translate-y-1/2 z-10 bg-white border border-slate-200 rounded-l-md p-1 shadow-sm hover:bg-slate-50"
-        style={{ right: rightPanelCollapsed ? 0 : 'auto', left: rightPanelCollapsed ? 'auto' : undefined }}
-      >
-        <ChevronRight className={`w-4 h-4 transition-transform ${rightPanelCollapsed ? '' : 'rotate-180'}`} />
+      {!rightPanelCollapsed && <button className="drawer-backdrop" aria-label="关闭详情面板" onClick={toggleRightPanel} />}
+      <aside className={`context-panel ${rightPanelCollapsed ? 'collapsed' : ''}`} aria-label="上下文详情面板" aria-hidden={rightPanelCollapsed} {...(rightPanelCollapsed ? { inert: '' } : {})}>
+        <div className="panel-top"><strong>上下文与操作</strong><button onClick={toggleRightPanel} aria-label="收起详情面板"><PanelRightClose /></button></div>
+        <div className="panel-scroll">{renderRightPanel()}</div>
+      </aside>
+      <button className={`panel-toggle ${rightPanelCollapsed ? '' : 'open'}`} onClick={toggleRightPanel} aria-label={rightPanelCollapsed ? '展开详情面板' : '收起详情面板'} aria-expanded={!rightPanelCollapsed}>
+        {rightPanelCollapsed ? <PanelRightOpen /> : <PanelRightClose />}
       </button>
+      {operationMessage && <div className={`toast ${operationMessage.kind}`} role="status">{operationMessage.text}</div>}
     </div>
   )
 }

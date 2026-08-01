@@ -53,6 +53,44 @@ export interface Alert {
   acknowledged: boolean
 }
 
+export type ContextKind = 'node' | 'device' | 'point' | 'alert' | 'report'
+
+export interface ContextSelection {
+  kind: ContextKind
+  id: string
+  label: string
+  page: string
+  detail?: Record<string, string | number | boolean | null>
+}
+
+export interface ActionRecord {
+  id: string
+  at: string
+  action: string
+  target: string
+  result: 'success' | 'failed'
+  detail?: string
+}
+
+export interface ControlActionPayload {
+  system: 'overview' | 'storage' | 'hvac'
+  action: string
+  target: string
+  value: number
+  unit: string
+  reason: string
+  actor: string
+}
+
+export interface ControlActionRecord extends ControlActionPayload {
+  action_id: string
+  run_id: string
+  submitted_at: string
+  status: 'accepted' | 'executed' | 'rejected'
+  applied_step: number | null
+  command_id: string | null
+}
+
 export interface SeriesPoint {
   time: string
   step: number

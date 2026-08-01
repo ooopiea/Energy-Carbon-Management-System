@@ -13,7 +13,21 @@ import random
 from datetime import datetime, timedelta
 from typing import Any
 
-from core.config import POINTS_PER_DAY, SIM_STEP_MINUTES
+from core.config import (
+    COMPRESSOR_DEFAULTS,
+    HVAC_DEFAULTS,
+    POINTS_PER_DAY,
+    SIMULATION_START_DATE,
+    SIM_STEP_MINUTES,
+    SITE_SOLAR_CAPACITY_KW,
+    TARIFF_PRICES,
+)
+from data.raw_loader import (
+    load_asset_registry,
+    load_generation_mix,
+    load_load_profile,
+    load_tariff_prices,
+)
 
 
 # 实际四季负荷基线（kW，96点），来自黄花园区用电负荷参考
@@ -96,15 +110,27 @@ class DataSimulator:
     def generate_day(self, day_index: int = 0, month: int = 7) -> dict[str, Any]:
         """生成一天完整的 96 点数据。"""
         season = _get_season(month)
-        base_date = datetime(2025, month, 15)
-        sim_date = base_date + timedelta(days=day_index)
+        anchored_date = SIMULATION_START_DATE + timedelta(days=day_index)
+        # engine 传入的是全局 day_index；跨月时必须以统一锚点推进，避免二次加日。
+        if anchored_date.month == month:
+            sim_date = datetime.combine(anchored_date, datetime.min.time())
+        else:
+            sim_date = datetime(2025, month, 15)
         timestamps = [
             sim_date.replace(hour=i // 4, minute=(i % 4) * 15, second=0, microsecond=0)
             for i in range(POINTS_PER_DAY)
         ]
 
         # --- 负荷 ---
-        load = self._gen_load(season, day_index)
+        load, load_source = load_load_profile(sim_date.date())
+        if load is None:
+            load = self._gen_load(season, day_index)
+            load_source = {
+                **load_source,
+                "source": "embedded_seasonal_profile_fallback",
+                "loaded": True,
+                "quality": "simulated",
+            }
 
         # --- 气象 ---
         weather = self._gen_weather(month, day_index)
@@ -113,12 +139,29 @@ class DataSimulator:
         solar = self._gen_solar(weather["solar_irradiance_wm2"], weather["cloud_cover"])
 
         # --- 发电结构（湖南电网）---
-        gen_mix = self._gen_generation_mix(day_index)
+        gen_mix, generation_source = load_generation_mix(sim_date.date())
+        if gen_mix is None:
+            gen_mix = self._gen_generation_mix(day_index)
+            generation_source = {
+                **generation_source,
+                "source": "calibrated_generation_fallback",
+                "loaded": True,
+                "quality": "simulated",
+            }
 
         # --- 电价 ---
         from core.config import build_price_series, build_period_map
-        price = build_price_series()
-        periods = build_period_map()
+        tariff_rates, tariff_source = load_tariff_prices(month)
+        if tariff_rates is None:
+            tariff_rates = TARIFF_PRICES
+            tariff_source = {
+                **tariff_source,
+                "source": "2026-01_tariff_proxy_fallback",
+                "loaded": True,
+                "quality": "proxy",
+            }
+        price = build_price_series(month, tariff_rates)
+        periods = build_period_map(month)
 
         # --- 生产排班 ---
         schedule = self._gen_schedule()
@@ -128,6 +171,29 @@ class DataSimulator:
 
         # --- 空压机负荷 ---
         compressor_load = self._gen_compressor_load(load, schedule)
+        from algorithms.compressor import assess_compressor_flexibility
+        compressor_capability = assess_compressor_flexibility(compressor_load)
+
+        assets, asset_source = load_asset_registry()
+        if not assets:
+            from algorithms.hvac import CURRENT_RUNNING_CHILLERS, TOTAL_CHILLERS, TOTAL_RATED_KW, get_chiller_topology
+            assets = {
+                "chillers": get_chiller_topology(),
+                "compressors": [],
+                "summary": {
+                    "chiller_units": TOTAL_CHILLERS,
+                    "running_chiller_units": CURRENT_RUNNING_CHILLERS,
+                    "installed_cooling_kw": TOTAL_RATED_KW,
+                    "compressor_units": COMPRESSOR_DEFAULTS["unit_count"],
+                    "installed_compressor_power_kw": COMPRESSOR_DEFAULTS["total_rated_power_kw"],
+                },
+            }
+            asset_source = {
+                **asset_source,
+                "source": "embedded_asset_registry_fallback",
+                "loaded": True,
+                "quality": "proxy",
+            }
 
         return {
             "timestamps": timestamps,
@@ -140,6 +206,25 @@ class DataSimulator:
             "schedule": schedule,
             "hvac_load_kw": hvac_load,
             "compressor_load_kw": compressor_load,
+            "compressor_capability": {
+                **compressor_capability,
+                "baseline_energy_kwh": round(sum(compressor_load) * 0.25, 1),
+                "reason": "缺少压缩空气压力、流量与储气罐状态，禁止虚构移峰调度",
+            },
+            "asset_registry": assets,
+            "data_provenance": {
+                "load": load_source,
+                "weather": {"source": "changsha_typical_day_model", "loaded": True, "quality": "simulated"},
+                "site_solar": {
+                    "source": "project_reference_docx_capacity_plus_weather_model",
+                    "loaded": True,
+                    "quality": "simulated",
+                    "capacity_kw": SITE_SOLAR_CAPACITY_KW,
+                },
+                "generation_mix": generation_source,
+                "tariff": tariff_source,
+                "assets": asset_source,
+            },
             "season": season,
             "month": month,
             "day_index": day_index,
@@ -220,8 +305,8 @@ class DataSimulator:
         }
 
     def _gen_solar(self, irradiance: list[float], cloud: list[float]) -> list[float]:
-        """厂区屋顶光伏：装机 5MW，转换效率 18%。"""
-        capacity_mw = 5.0
+        """厂区屋顶光伏：按参考文件确认的 19.1 MW 装机容量建模。"""
+        capacity_mw = SITE_SOLAR_CAPACITY_KW / 1000.0
         efficiency = 0.18
         panel_area_m2 = capacity_mw * 1e6 / (1000 * efficiency)
         result = []
@@ -254,7 +339,9 @@ class DataSimulator:
                 solar = 0
             solar = max(0, solar)
 
-            total = coal + hydro + wind + solar
+            # 原始数据中上述四类平均仅覆盖总出力约 37%，其余出力显式归入 other。
+            other = max(0.0, 12_500 + self._rng.gauss(0, 800))
+            total = coal + hydro + wind + solar + other
             if total <= 0:
                 total = 1
 
@@ -263,6 +350,7 @@ class DataSimulator:
                 "hydro": round(hydro, 1),
                 "wind": max(0, round(wind, 1)),
                 "solar": round(solar, 1),
+                "other": round(other, 1),
                 "total": round(total, 1),
             })
         return result
@@ -285,32 +373,29 @@ class DataSimulator:
         return {"shifts": shifts}
 
     def _gen_hvac_load(self, temps: list[float], load: list[float], schedule: dict) -> list[float]:
-        """HVAC 负荷：与温度和排班强度相关。
-
-        夏季：制冷负荷 = f(室外温度 - 设定温度) × 生产强度
-        """
-        setpoint = 26.0  # 室内设定温度
-        result = []
+        """分解 HVAC 制冷负荷（热负荷），日均电力占比按参考文件校准。"""
+        auxiliary_share = 0.73 / (1.0 + 0.73)
+        hvac_electric_share = auxiliary_share * 0.44
+        weights = []
         for i, temp in enumerate(temps):
             intensity = schedule["shifts"][i]["intensity"]
-            if temp > setpoint:
-                # 制冷需求与温差成正比
-                delta_t = temp - setpoint
-                base_hvac = delta_t * 800 * intensity  # kW per degree
-            else:
-                base_hvac = 200 * intensity  # 基础通风/水泵
-            noise = self._rng.gauss(0, 50)
-            result.append(max(0, round(base_hvac + noise, 1)))
-        return result
+            weights.append(max(0.2, 0.65 + 0.05 * max(0.0, temp - 26.0) + 0.25 * intensity))
+        target_electric_energy = sum(load) * hvac_electric_share
+        scale = target_electric_energy / max(sum(load[i] * weights[i] for i in range(len(load))), 1.0)
+        return [
+            round(load[i] * weights[i] * scale * HVAC_DEFAULTS["cop_nominal"], 1)
+            for i in range(len(load))
+        ]
 
     def _gen_compressor_load(self, load: list[float], schedule: dict) -> list[float]:
-        """空压机负荷：约占总负荷的 15-20%。"""
-        result = []
-        for i, total_load in enumerate(load):
-            intensity = schedule["shifts"][i]["intensity"]
-            ratio = 0.15 + 0.03 * self._rng.random()
-            result.append(round(total_load * ratio * intensity / 0.9, 1))
-        return result
+        """空压机电负荷：按“辅助负荷的 40%”校准，并受台账装机上限约束。"""
+        auxiliary_share = 0.73 / (1.0 + 0.73)
+        compressor_share = auxiliary_share * 0.40
+        weights = [0.7 + 0.3 * item["intensity"] for item in schedule["shifts"]]
+        target_energy = sum(load) * compressor_share
+        scale = target_energy / max(sum(load[i] * weights[i] for i in range(len(load))), 1.0)
+        capacity = COMPRESSOR_DEFAULTS["total_rated_power_kw"]
+        return [round(min(capacity, load[i] * weights[i] * scale), 1) for i in range(len(load))]
 
 
 # 全局模拟器实例

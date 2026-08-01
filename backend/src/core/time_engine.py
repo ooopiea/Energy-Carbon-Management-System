@@ -1,24 +1,15 @@
-"""200x 速时间引擎：系统自主计时，1 现实秒 = 200 模拟秒。
-
-一个完整模拟日（24h = 86400s）仅需 432 现实秒（约 7.2 分钟）。
-每次 tick 推进 15 分钟模拟时间（= 4.5 秒现实时间）。
-"""
+"""Monotonic 200x simulation clock with atomic pause/resume/reset semantics."""
 from __future__ import annotations
 
-import asyncio
 import threading
-from collections.abc import Callable
+import time
 from datetime import datetime, timedelta
 
 from core.config import SIM_STEP_MINUTES, TIME_SCALE
 
 
 class TimeEngine:
-    """模拟时钟：基于系统真实时间乘以倍率推进。
-
-    设计为线程安全单例，供 FastAPI 和 LangGraph 共享。
-    每次 tick 对应一个 15min 模拟步，推进时回调所有注册的监听器。
-    """
+    """Thread-safe simulation clock; one 15-minute step is 4.5 real seconds at 200x."""
 
     def __init__(
         self,
@@ -26,101 +17,109 @@ class TimeEngine:
         time_scale: int = TIME_SCALE,
         step_minutes: int = SIM_STEP_MINUTES,
     ):
-        # 模拟日从 00:00 开始
+        if time_scale <= 0:
+            raise ValueError("time_scale must be positive")
+        if step_minutes <= 0 or 1440 % step_minutes:
+            raise ValueError("step_minutes must divide one day")
         self._sim_start = start_time or datetime(2025, 7, 15, 0, 0, 0)
-        self._real_start = datetime.now()
         self._time_scale = time_scale
         self._step_minutes = step_minutes
+        self._points_per_day = 1440 // step_minutes
+        self._lock = threading.RLock()
+        self._anchor_real = time.monotonic()
+        self._elapsed_real_seconds = 0.0
         self._paused = False
-        self._pause_offset = timedelta(0)
-        self._pause_start: datetime | None = None
-        self._listeners: list[Callable[[datetime, int], None]] = []
-        self._async_listeners: list[Callable] = []
-        self._lock = threading.Lock()
-        self._current_step = 0
-        self._day_count = 0
+
+    def _elapsed_real(self, now: float) -> float:
+        elapsed = self._elapsed_real_seconds
+        if not self._paused:
+            elapsed += now - self._anchor_real
+        return max(0.0, elapsed)
+
+    def _snapshot_values(self) -> tuple[datetime, int, int, float]:
+        with self._lock:
+            now = time.monotonic()
+            sim_time = self._sim_start + timedelta(
+                seconds=self._elapsed_real(now) * self._time_scale
+            )
+            minutes = sim_time.hour * 60 + sim_time.minute
+            step = min(self._points_per_day - 1, minutes // self._step_minutes)
+            day = (sim_time.date() - self._sim_start.date()).days
+            progress = step / float(self._points_per_day)
+            return sim_time, int(step), day, progress
 
     @property
     def sim_time(self) -> datetime:
-        """当前模拟时间。"""
-        if self._paused:
-            elapsed = self._pause_start - self._real_start - self._pause_offset
-        else:
-            elapsed = datetime.now() - self._real_start - self._pause_offset
-        sim_delta = timedelta(seconds=elapsed.total_seconds() * self._time_scale)
-        return self._sim_start + sim_delta
+        return self._snapshot_values()[0]
 
     @property
     def current_step(self) -> int:
-        """当前 15min 步索引（0-95）。"""
-        t = self.sim_time
-        return int(t.hour * 4 + t.minute // self._step_minutes)
+        return self._snapshot_values()[1]
 
     @property
     def day_count(self) -> int:
-        """已过去的模拟天数（0=第一天）。"""
-        t = self.sim_time
-        return (t.date() - self._sim_start.date()).days
+        return self._snapshot_values()[2]
 
     @property
     def sim_step_seconds(self) -> float:
-        """一个 15min 模拟步对应的现实秒数。"""
         return (self._step_minutes * 60) / self._time_scale
 
     @property
     def is_paused(self) -> bool:
-        return self._paused
+        with self._lock:
+            return self._paused
 
     @property
     def progress_ratio(self) -> float:
-        """当天进度（0.0 - 1.0）。"""
-        return self.current_step / 96.0
+        return self._snapshot_values()[3]
 
-    def pause(self):
-        if not self._paused:
-            self._pause_start = datetime.now()
+    def pause(self) -> None:
+        with self._lock:
+            if self._paused:
+                return
+            now = time.monotonic()
+            self._elapsed_real_seconds += now - self._anchor_real
             self._paused = True
 
-    def resume(self):
-        if self._paused and self._pause_start:
-            self._pause_offset += datetime.now() - self._pause_start
+    def resume(self) -> None:
+        with self._lock:
+            if not self._paused:
+                return
+            self._anchor_real = time.monotonic()
             self._paused = False
 
-    def reset(self):
-        self._real_start = datetime.now()
-        self._pause_offset = timedelta(0)
-        self._paused = False
-        self._current_step = 0
-
-    def add_listener(self, callback: Callable[[datetime, int], None]):
+    def reset(self, start_time: datetime | None = None) -> None:
+        """Atomically return to step zero; the owning SimulationEngine resets domain state."""
         with self._lock:
-            self._listeners.append(callback)
-
-    def add_async_listener(self, callback):
-        with self._lock:
-            self._async_listeners.append(callback)
+            if start_time is not None:
+                self._sim_start = start_time
+            self._anchor_real = time.monotonic()
+            self._elapsed_real_seconds = 0.0
+            self._paused = False
 
     def tick_info(self) -> dict:
-        """返回当前 tick 的完整信息。"""
-        t = self.sim_time
-        step = self.current_step
+        sim_time, step, day, progress = self._snapshot_values()
+        with self._lock:
+            paused = self._paused
         return {
-            "sim_time": t.isoformat(),
+            "sim_time": sim_time.isoformat(),
             "step": step,
-            "day": self.day_count,
-            "hour": t.hour + t.minute / 60.0,
-            "progress": self.progress_ratio,
-            "paused": self._paused,
+            "day": day,
+            "hour": sim_time.hour + sim_time.minute / 60.0,
+            "progress": progress,
+            "paused": paused,
             "time_scale": self._time_scale,
         }
 
 
-# 全局单例
 _engine: TimeEngine | None = None
+_engine_lock = threading.Lock()
 
 
 def get_time_engine() -> TimeEngine:
     global _engine
     if _engine is None:
-        _engine = TimeEngine()
+        with _engine_lock:
+            if _engine is None:
+                _engine = TimeEngine()
     return _engine

@@ -6,7 +6,6 @@ v3 的状态分为两部分：
 """
 from __future__ import annotations
 
-from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -71,6 +70,8 @@ class AgentReport(BaseModel):
     created_at: datetime
     status: Literal["pending", "approved", "rejected"] = "pending"
     severity: Severity = Severity.INFO
+    content_hash: str = ""
+    run_id: str = ""
 
 
 class ApprovalGate(BaseModel):
@@ -80,9 +81,12 @@ class ApprovalGate(BaseModel):
     description: str
     status: NodeStatus = NodeStatus.IDLE
     report: AgentReport | None = None
+    report_id: str | None = None
+    report_hash: str | None = None
     decision: Literal["approve", "reject", "revise"] | None = None
     comment: str = ""
     decided_at: datetime | None = None
+    decided_by: str | None = None
 
 
 class AlertItem(BaseModel):
@@ -93,6 +97,69 @@ class AlertItem(BaseModel):
     message: str
     timestamp: datetime
     acknowledged: bool = False
+
+
+class DispatchCommand(BaseModel):
+    """发送给物理执行端（当前为模拟执行器）的单步命令。"""
+
+    command_id: str
+    run_id: str
+    step: int
+    sim_time: datetime
+    storage_power_kw: float
+    hvac_power_kw: float
+    storage_report_id: str
+    storage_report_hash: str
+    hvac_report_id: str
+    hvac_report_hash: str
+    created_at: datetime
+    manual_override: dict[str, Any] | None = None
+
+
+class ExecutionAck(BaseModel):
+    """执行端对命令的明确回执。"""
+
+    command_id: str
+    accepted: bool
+    status: Literal["executed", "rejected", "failed"]
+    message: str = ""
+    acknowledged_at: datetime
+
+
+class DispatchFeedback(BaseModel):
+    """设备侧测量反馈，用于计划—执行偏差闭环。"""
+
+    command_id: str
+    measured_storage_power_kw: float
+    measured_hvac_power_kw: float
+    storage_deviation_kw: float
+    hvac_deviation_kw: float
+    max_deviation_ratio: float
+    measured_at: datetime
+
+
+class DispatchExecution(BaseModel):
+    command: DispatchCommand
+    ack: ExecutionAck
+    feedback: DispatchFeedback
+
+
+class ControlActionRecord(BaseModel):
+    """Auditable operator action, optionally consumed by the next physical step."""
+
+    action_id: str
+    run_id: str
+    system: Literal["overview", "storage", "hvac"]
+    action: str
+    target: str
+    value: float
+    unit: str
+    reason: str
+    actor: str
+    submitted_at: datetime
+    status: Literal["accepted", "executed", "rejected"] = "accepted"
+    applied_step: int | None = None
+    command_id: str | None = None
 
 
 class TimeSeriesPoint(BaseModel):
