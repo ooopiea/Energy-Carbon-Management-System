@@ -5,14 +5,18 @@ import { Overview } from './pages/Overview'
 import { AgentFlow } from './pages/AgentFlow'
 import { StoragePage } from './pages/StoragePage'
 import { HVACPage } from './pages/HVACPage'
+import { FacilityChat } from './pages/FacilityChat'
+import { ReportPage } from './pages/ReportPage'
 
 export default function App() {
-  const { activePage, fetchState, fetchGraph, fetchControlActions } = useAppStore()
+  const { activePage, fetchState, fetchGraph, fetchControlActions, fetchChatHistory, fetchLlmStatus } = useAppStore()
 
   useEffect(() => {
     fetchState()
     fetchGraph()
     fetchControlActions()
+    fetchChatHistory()
+    fetchLlmStatus()
     connectWebSocket()
     const interval = setInterval(() => { fetchState(); fetchControlActions() }, 5000)
     return () => {
@@ -27,6 +31,8 @@ export default function App() {
       case 'overview': return <Overview />
       case 'storage': return <StoragePage />
       case 'hvac': return <HVACPage />
+      case 'facility_chat': return <FacilityChat />
+      case 'report': return <ReportPage />
       default: return <Overview />
     }
   }

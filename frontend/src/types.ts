@@ -28,6 +28,8 @@ export interface ApprovalGate {
   description: string
   status: string
   report: any | null
+  report_id: string | null
+  report_hash: string | null
   decision: string | null
   comment: string
   decided_at: string | null
@@ -42,6 +44,8 @@ export interface Report {
   created_at: string
   status: string
   severity: string
+  content_hash: string
+  run_id: string
 }
 
 export interface Alert {
@@ -89,6 +93,48 @@ export interface ControlActionRecord extends ControlActionPayload {
   status: 'accepted' | 'executed' | 'rejected'
   applied_step: number | null
   command_id: string | null
+}
+
+export interface DisturbanceEvent {
+  event_id: string
+  run_id: string
+  actor: string
+  actor_role: 'engineer' | 'facility'
+  source_text: string
+  event_type: 'equipment_failure' | 'equipment_recovery' | 'load_adjustment' | 'weather_override' | 'price_override' | 'schedule_change' | 'operational_note'
+  target: string
+  start_time: string
+  end_time: string | null
+  parameters: Record<string, string | number | boolean>
+  summary: string
+  confidence: number
+  parsed_by: string
+  status: 'proposed' | 'applied' | 'cancelled' | 'failed'
+  created_at: string
+  decided_at: string | null
+  decided_by: string | null
+  impact_summary: string
+}
+
+export interface ChatMessage {
+  message_id: string
+  role: 'user' | 'assistant'
+  actor_role: 'engineer' | 'facility'
+  actor: string
+  content: string
+  created_at: string
+  event_ids: string[]
+  tool_trace: Array<{ name: string; result: unknown }>
+  mode: 'user' | 'glm' | 'rule_fallback'
+}
+
+export interface LlmStatus {
+  provider: string
+  configured: boolean
+  model: string
+  base_url: string
+  thinking: string
+  last_error: string | null
 }
 
 export interface SeriesPoint {
@@ -170,6 +216,7 @@ export interface RuntimeState {
   storage_temp_c: number
   hvac_power_kw: number
   hvac_supply_temp_c: number
+  hvac_return_temp_c: number
   carbon_factor: number
   price: number
   tariff_period: string
@@ -195,4 +242,15 @@ export interface RuntimeState {
     humidity: number
     wind: number
   }
+  workflow: { run_id: string; status: string; current_node: string }
+  physical_dispatch: { enabled: boolean; last_execution: any; command_count: number }
+  data_timeline: {
+    start: string | null
+    end: string | null
+    current_source_date: string | null
+    resolution_minutes: number
+    provenance: Record<string, unknown>
+  }
+  disturbances: DisturbanceEvent[]
+  active_strategy: { demand_cap_kw: number | null; enabled: boolean }
 }

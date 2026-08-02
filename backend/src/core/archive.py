@@ -91,6 +91,15 @@ class ArchiveStore:
     ) -> Path:
         return self._write_event("control_actions", event_type, action, sim_date, run_id)
 
+    def archive_disturbance(
+        self,
+        event: Any,
+        sim_date: date,
+        run_id: str,
+        event_type: str = "disturbance_proposed",
+    ) -> Path:
+        return self._write_event("disturbances", event_type, event, sim_date, run_id)
+
     def append_realtime(self, row: dict[str, Any], sim_date: date, run_id: str) -> Path:
         """Append one physical-time row; header is created exactly once per run."""
         with self._lock:

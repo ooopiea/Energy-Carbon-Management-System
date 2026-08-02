@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import random
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from core.config import (
@@ -107,10 +107,15 @@ class DataSimulator:
     def __init__(self, seed: int | None = None):
         self._rng = random.Random(seed)
 
-    def generate_day(self, day_index: int = 0, month: int = 7) -> dict[str, Any]:
+    def generate_day(
+        self,
+        day_index: int = 0,
+        month: int = 7,
+        target_date: date | None = None,
+    ) -> dict[str, Any]:
         """生成一天完整的 96 点数据。"""
         season = _get_season(month)
-        anchored_date = SIMULATION_START_DATE + timedelta(days=day_index)
+        anchored_date = target_date or (SIMULATION_START_DATE + timedelta(days=day_index))
         # engine 传入的是全局 day_index；跨月时必须以统一锚点推进，避免二次加日。
         if anchored_date.month == month:
             sim_date = datetime.combine(anchored_date, datetime.min.time())
@@ -409,6 +414,10 @@ def get_simulator() -> DataSimulator:
     return _sim
 
 
-def generate_day_ahead_data(day_index: int = 0, month: int = 7) -> dict[str, Any]:
+def generate_day_ahead_data(
+    day_index: int = 0,
+    month: int = 7,
+    target_date: date | None = None,
+) -> dict[str, Any]:
     """便捷入口：生成日前数据。"""
-    return get_simulator().generate_day(day_index, month)
+    return get_simulator().generate_day(day_index, month, target_date)

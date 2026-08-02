@@ -41,12 +41,12 @@ GRAPH_NODES = [
     },
     {
         "id": "prediction_agent",
-        "label": "预测 Agent",
+        "label": "负荷处理 Agent",
         "type": "agent",
         "agent": "prediction",
         "x": 400, "y": 260,
-        "tools": ["负荷预测模型"],
-        "description": "结合排班、气象、近日数据进行日前负荷预测",
+        "tools": ["质量校验", "时间粒度转换"],
+        "description": "校验实测负荷，并在输入较粗时转换为15分钟粒度；暂不外推未来负荷",
     },
     {
         "id": "forecast_approval",
@@ -54,7 +54,7 @@ GRAPH_NODES = [
         "type": "approval",
         "agent": None,
         "x": 400, "y": 380,
-        "description": "审批负荷预测报告",
+        "description": "审批负荷处理与粒度转换报告",
     },
     {
         "id": "storage_agent",
@@ -127,7 +127,7 @@ GRAPH_NODES = [
 GRAPH_EDGES = [
     {"from": "start", "to": "data_agent", "type": "normal"},
     {"from": "data_agent", "to": "prediction_agent", "type": "normal", "label": "日前数据"},
-    {"from": "prediction_agent", "to": "forecast_approval", "type": "normal", "label": "预测报告"},
+    {"from": "prediction_agent", "to": "forecast_approval", "type": "normal", "label": "负荷处理报告"},
     {"from": "forecast_approval", "to": "storage_agent", "type": "approve", "label": "批准"},
     {"from": "forecast_approval", "to": "hvac_agent", "type": "approve", "label": "批准"},
     {"from": "storage_agent", "to": "storage_approval", "type": "normal", "label": "调度策略"},

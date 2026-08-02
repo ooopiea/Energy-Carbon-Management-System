@@ -34,6 +34,7 @@ def optimize_hvac_dispatch(
     outdoor_temp_c: list[float],
     price_cny_per_kwh: list[float],
     tariff_periods: list[str],
+    available_chillers: list[int] | None = None,
 ) -> dict[str, Any]:
     """按台账容量和部分负荷效率进行冷机群启停优化。
 
@@ -43,6 +44,9 @@ def optimize_hvac_dispatch(
     n = len(cooling_load_kw)
     if n == 0 or not (len(outdoor_temp_c) == len(price_cny_per_kwh) == len(tariff_periods) == n):
         raise ValueError("all HVAC input series must be non-empty and equal length")
+    availability = available_chillers or [TOTAL_CHILLERS] * n
+    if len(availability) != n or any(not 0 <= int(value) <= TOTAL_CHILLERS for value in availability):
+        raise ValueError("available_chillers must match inputs and stay within asset count")
 
     power_kw = []
     baseline_power_kw = []
@@ -53,13 +57,22 @@ def optimize_hvac_dispatch(
     ice_storage_level = [0.0] * n
     violations = []
     avg_unit_cooling = TOTAL_RATED_KW / TOTAL_CHILLERS
+    min_price = min(price_cny_per_kwh)
+    price_span = max(price_cny_per_kwh) - min_price
 
     for t in range(n):
         load = max(0, cooling_load_kw[t])
         temp = outdoor_temp_c[t]
-        if load > TOTAL_RATED_KW:
-            violations.append({"step": t, "code": "COOLING_CAPACITY_EXCEEDED", "value": round(load, 1)})
-        served_load = min(load, TOTAL_RATED_KW)
+        available_count = int(availability[t])
+        available_capacity = available_count * avg_unit_cooling
+        if load > available_capacity:
+            violations.append({
+                "step": t,
+                "code": "COOLING_CAPACITY_EXCEEDED",
+                "value": round(load, 1),
+                "available_capacity_kw": round(available_capacity, 1),
+            })
+        served_load = min(load, available_capacity)
         weather_cop = HVAC_DEFAULTS["cop_nominal"] - max(0.0, temp - 25.0) * 0.08
         weather_cop = max(HVAC_DEFAULTS["cop_min"], min(5.5, weather_cop))
 
@@ -70,20 +83,27 @@ def optimize_hvac_dispatch(
             weather_cop * (0.82 + 0.18 * min(1.0, baseline_plr / 0.80)),
         )
 
-        n_chillers = max(1, min(TOTAL_CHILLERS, math.ceil(served_load / (avg_unit_cooling * 0.82))))
+        requested = math.ceil(served_load / (avg_unit_cooling * 0.82)) if served_load > 0 else 0
+        n_chillers = max(0, min(available_count, requested))
         optimized_plr = min(1.0, served_load / max(avg_unit_cooling, n_chillers * avg_unit_cooling))
         cop = max(
             baseline_cop,
             weather_cop * (0.86 + 0.14 * min(1.0, optimized_plr / 0.82)),
         )
+        price_signal = (
+            (price_cny_per_kwh[t] - min_price) / price_span if price_span > 1e-9 else 0.5
+        )
         # 冷机输入功率 + 8% 水泵/冷却塔辅助功率。
         baseline_elec = served_load / baseline_cop * 1.08
-        elec_power = served_load / cop * 1.08
-
         ratio = min(1.0, served_load / TOTAL_RATED_KW)
 
-        # 供水温度：负荷率越高温度越低
-        supply_t = max(5.0, min(9.0, HVAC_DEFAULTS["chilled_water_temp_setpoint_c"] - ratio * 1.0))
+        # 电价高时在工艺许可范围内提高供水温度，降低压缩机扬程；
+        # 电价低时适度降低设定值，形成可审计的价格响应，但不虚构蓄冷库存。
+        base_supply = HVAC_DEFAULTS["chilled_water_temp_setpoint_c"] - ratio * 1.0
+        supply_t = max(5.0, min(9.0, base_supply + (price_signal - 0.5) * 1.0))
+        cop *= 1.0 + 0.025 * (supply_t - base_supply)
+        cop = max(HVAC_DEFAULTS["cop_min"], min(5.5, cop))
+        elec_power = served_load / cop * 1.08
         return_t = min(HVAC_DEFAULTS["return_water_temp_max_c"], supply_t + 5.0)
 
         power_kw.append(round(elec_power, 1))
@@ -108,12 +128,14 @@ def optimize_hvac_dispatch(
         "ice_storage_kwh": ice_storage_level,
         "total_chillers": TOTAL_CHILLERS,
         "total_rated_kw": TOTAL_RATED_KW,
+        "available_chillers": [int(value) for value in availability],
         "baseline_cost_cny": round(baseline_cost, 2),
         "optimized_cost_cny": round(optimized_cost, 2),
         "saving_cny": round(baseline_cost - optimized_cost, 2),
         "avg_cop": round(sum(cop_series) / len(cop_series), 2) if cop_series else 0,
         "violations": violations,
         "thermal_storage_enabled": False,
+        "price_response_enabled": True,
         "model_assumptions": [
             "冷机台账额定功率按额定制冷量解释",
             "缺少冰蓄冷资产依据，默认不启用蓄冷",

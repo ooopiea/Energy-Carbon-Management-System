@@ -108,6 +108,7 @@ class DispatchCommand(BaseModel):
     sim_time: datetime
     storage_power_kw: float
     hvac_power_kw: float
+    hvac_supply_temp_c: float
     storage_report_id: str
     storage_report_hash: str
     hvac_report_id: str
@@ -132,6 +133,10 @@ class DispatchFeedback(BaseModel):
     command_id: str
     measured_storage_power_kw: float
     measured_hvac_power_kw: float
+    measured_storage_soc: float
+    measured_storage_temp_c: float
+    measured_hvac_supply_temp_c: float
+    measured_hvac_return_temp_c: float
     storage_deviation_kw: float
     hvac_deviation_kw: float
     max_deviation_ratio: float
@@ -160,6 +165,37 @@ class ControlActionRecord(BaseModel):
     status: Literal["accepted", "executed", "rejected"] = "accepted"
     applied_step: int | None = None
     command_id: str | None = None
+
+
+class DisturbanceEvent(BaseModel):
+    """Natural-language operating disturbance awaiting an explicit human decision."""
+
+    event_id: str
+    run_id: str
+    actor: str
+    actor_role: Literal["engineer", "facility"]
+    source_text: str
+    event_type: Literal[
+        "equipment_failure",
+        "equipment_recovery",
+        "load_adjustment",
+        "weather_override",
+        "price_override",
+        "schedule_change",
+        "operational_note",
+    ]
+    target: str
+    start_time: datetime
+    end_time: datetime | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    summary: str
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    parsed_by: str = "rule_fallback"
+    status: Literal["proposed", "applied", "cancelled", "failed"] = "proposed"
+    created_at: datetime
+    decided_at: datetime | None = None
+    decided_by: str | None = None
+    impact_summary: str = ""
 
 
 class TimeSeriesPoint(BaseModel):

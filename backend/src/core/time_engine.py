@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from core.config import SIM_STEP_MINUTES, TIME_SCALE
+from core.config import SIM_STEP_MINUTES, SIMULATION_START_DATE, TIME_SCALE
 
 
 class TimeEngine:
@@ -21,7 +21,7 @@ class TimeEngine:
             raise ValueError("time_scale must be positive")
         if step_minutes <= 0 or 1440 % step_minutes:
             raise ValueError("step_minutes must divide one day")
-        self._sim_start = start_time or datetime(2025, 7, 15, 0, 0, 0)
+        self._sim_start = start_time or datetime.combine(SIMULATION_START_DATE, datetime.min.time())
         self._time_scale = time_scale
         self._step_minutes = step_minutes
         self._points_per_day = 1440 // step_minutes
@@ -116,10 +116,10 @@ _engine: TimeEngine | None = None
 _engine_lock = threading.Lock()
 
 
-def get_time_engine() -> TimeEngine:
+def get_time_engine(start_time: datetime | None = None) -> TimeEngine:
     global _engine
     if _engine is None:
         with _engine_lock:
             if _engine is None:
-                _engine = TimeEngine()
+                _engine = TimeEngine(start_time=start_time)
     return _engine

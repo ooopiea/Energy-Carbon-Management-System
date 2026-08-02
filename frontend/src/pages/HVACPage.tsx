@@ -9,6 +9,11 @@ export function HVACPage() {
   const { state, contextSelection, setContextSelection } = useAppStore()
   if (!state) return null
   const hs = state.hvac_summary
+  const actual = (key: string) => {
+    const values: Array<number | null> = Array(96).fill(null)
+    ;(state.series[key] || []).forEach(point => { values[point.step] = point.value })
+    return values
+  }
   const totalChillers = state.chiller_topology.reduce((s, c) => s + c.chiller_count, 0)
   const activeCount = hs?.active_chillers[state.time.step] || 0
   const select = (id: string, label: string, detail: Record<string, string | number>) => setContextSelection({ kind: 'device', id, label, page: 'hvac', detail })
@@ -26,8 +31,8 @@ export function HVACPage() {
       <span className="pipe return">回水 {hs?.return_temp_c[state.time.step]?.toFixed(1) || '—'} °C</span>
     </div></Card>
     <div className="two-col">
-      <Card title="供回水温度" icon={<Thermometer className="icon-sm industrial" />}><ReactECharts option={{ ...base, legend: { top: 5, textStyle: { fontSize: 10 } }, yAxis: { type: 'value', name: '°C', axisLabel: { fontSize: 9 } }, series: [{ name: '供水温度', type: 'line', symbol: 'none', data: hs?.supply_temp_c || [], lineStyle: { color: '#176b87', width: 2 } }, { name: '回水温度', type: 'line', symbol: 'none', data: hs?.return_temp_c || [], lineStyle: { color: '#d97706', width: 2 } }] }} onEvents={{ click: selectPoint }} style={{ height: 260 }} /></Card>
-      <Card title="COP 与运行功率" icon={<Gauge className="icon-sm industrial" />}><ReactECharts option={{ ...base, legend: { top: 5, textStyle: { fontSize: 10 } }, yAxis: [{ type: 'value', name: 'COP', axisLabel: { fontSize: 9 } }, { type: 'value', name: 'kW', axisLabel: { fontSize: 9 } }], series: [{ name: 'COP', type: 'line', symbol: 'none', data: hs?.cop || [], lineStyle: { color: '#15803d', width: 2 } }, { name: '运行功率', type: 'line', symbol: 'none', yAxisIndex: 1, data: hs?.power_kw || [], lineStyle: { color: '#176b87', width: 2 } }] }} onEvents={{ click: selectPoint }} style={{ height: 260 }} /></Card>
+      <Card title="供回水计划与实时反馈" icon={<Thermometer className="icon-sm industrial" />}><ReactECharts option={{ ...base, legend: { top: 5, textStyle: { fontSize: 10 } }, yAxis: { type: 'value', name: '°C', axisLabel: { fontSize: 9 } }, series: [{ name: '日前供水', type: 'line', symbol: 'none', data: hs?.supply_temp_c || [], lineStyle: { color: '#8da1a6', type: 'dashed' } }, { name: '实时供水', type: 'line', connectNulls: false, symbol: 'circle', symbolSize: 3, data: actual('hvac_supply_temp'), lineStyle: { color: '#176b87', width: 2 } }, { name: '实时回水', type: 'line', connectNulls: false, symbol: 'circle', symbolSize: 3, data: actual('hvac_return_temp'), lineStyle: { color: '#d97706', width: 2 } }] }} onEvents={{ click: selectPoint }} style={{ height: 260 }} /></Card>
+      <Card title="COP 计划与实时功率" icon={<Gauge className="icon-sm industrial" />}><ReactECharts option={{ ...base, legend: { top: 5, textStyle: { fontSize: 10 } }, yAxis: [{ type: 'value', name: 'COP', axisLabel: { fontSize: 9 } }, { type: 'value', name: 'kW', axisLabel: { fontSize: 9 } }], series: [{ name: '日前COP', type: 'line', symbol: 'none', data: hs?.cop || [], lineStyle: { color: '#15803d', type: 'dashed' } }, { name: '实时功率', type: 'line', connectNulls: false, symbol: 'circle', symbolSize: 3, yAxisIndex: 1, data: actual('hvac_power'), lineStyle: { color: '#176b87', width: 2 } }] }} onEvents={{ click: selectPoint }} style={{ height: 260 }} /></Card>
     </div>
     <Card title="冷机站群" icon={<Snowflake className="icon-sm industrial" />}><div className="station-grid">{state.chiller_topology.map((station, i) => { const allocated = Math.min(station.chiller_count, Math.max(0, activeCount - state.chiller_topology.slice(0, i).reduce((n, s) => n + s.chiller_count, 0))); return <button key={station.name} className={contextSelection?.id === `station-${i}` ? 'active' : ''} onClick={() => select(`station-${i}`, station.name, { active: `${allocated}/${station.chiller_count} 台`, ratedPower: `${(station.total_rated_kw / 1000).toFixed(1)} MW` })}><Snowflake /><strong>{station.name}</strong><span>{allocated}/{station.chiller_count} 台运行</span><small>{(station.total_rated_kw / 1000).toFixed(1)} MW 额定</small></button>})}</div></Card>
   </div>

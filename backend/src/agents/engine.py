@@ -8,7 +8,7 @@ import os
 import random
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,14 +33,18 @@ from core.state import (
     ApprovalGate,
     ControlActionRecord,
     DispatchExecution,
+    DisturbanceEvent,
     EnergySystemState,
     NodeStatus,
     PhysicsConstraints,
     Severity,
 )
 from core.time_engine import TimeEngine, get_time_engine
+from data.raw_loader import get_load_data_range, process_load_to_15min
 from data.simulator import generate_day_ahead_data
 from graph.workflow import build_energy_workflow
+from agents.reasoning import AgentReasoningService
+from llm.glm_client import GlmClient
 
 
 class ApprovalError(ValueError):
@@ -75,12 +79,19 @@ class SimulationEngine:
         archive_root: str | Path | None = None,
         time_engine: TimeEngine | None = None,
         executor: SimulationExecutor | None = None,
+        glm_client: GlmClient | None = None,
     ):
         self._rng = random.Random(123)
         self._constraints = PhysicsConstraints()
-        self._time = time_engine or get_time_engine()
+        data_start, data_end, data_range_provenance = get_load_data_range()
+        self._data_start = data_start
+        self._data_end = data_end
+        self._data_range_provenance = data_range_provenance
+        resolved_start = datetime.combine(data_start, datetime.min.time()) if data_start else None
+        self._time = time_engine or get_time_engine(resolved_start)
         self._archive = ArchiveStore(archive_root)
         self._executor = executor or SimulationExecutor()
+        self._reasoning = AgentReasoningService(glm_client)
         self._transition_lock = asyncio.Lock()
         self._broadcast_lock = asyncio.Lock()
         self._ws_clients: set[Any] = set()
@@ -124,6 +135,7 @@ class SimulationEngine:
         self._reports: list[AgentReport] = []
         self._alerts: list[AlertItem] = []
         self._control_actions: list[ControlActionRecord] = []
+        self._disturbance_events: list[DisturbanceEvent] = []
         self._pending_overrides: dict[str, ControlActionRecord] = {}
         self._agent_nodes: dict[str, AgentNodeStatus] = {}
         self._approval_gates: dict[str, ApprovalGate] = {}
@@ -141,6 +153,7 @@ class SimulationEngine:
         self._last_execution: DispatchExecution | None = None
         self._command_count = 0
         self._current_values = self._empty_current_values()
+        self._demand_cap_kw: float | None = None
         self._pending_overrides = {}
         self._init_nodes()
 
@@ -155,6 +168,7 @@ class SimulationEngine:
             "storage_temp_c": 25.0,
             "hvac_power_kw": 0.0,
             "hvac_supply_temp_c": 7.0,
+            "hvac_return_temp_c": 12.0,
             "hvac_delta_kw": 0.0,
             "carbon_factor": 0.5,
             "price": 0.0,
@@ -167,7 +181,7 @@ class SimulationEngine:
         for node_id, agent_type, name in [
             ("data_collect", AgentType.DATA, "数据采集"),
             ("data_archive", AgentType.DATA, "数据封存"),
-            ("prediction", AgentType.PREDICTION, "负荷预测"),
+            ("prediction", AgentType.PREDICTION, "负荷处理"),
             ("storage_dispatch", AgentType.STORAGE, "储能调度"),
             ("hvac_dispatch", AgentType.HVAC, "HVAC调度"),
             ("monitor", AgentType.MONITOR, "系统监察"),
@@ -178,7 +192,7 @@ class SimulationEngine:
                 name=name,
             )
         for gate_id, name, description in [
-            ("forecast_approval", "预测审批", "负荷预测报告工程师审批"),
+            ("forecast_approval", "负荷处理审批", "负荷清洗与粒度转换结果工程师审批"),
             ("storage_approval", "储能审批", "储能调度策略工程师审批"),
             ("hvac_approval", "HVAC审批", "HVAC调度策略工程师审批"),
         ]:
@@ -247,8 +261,10 @@ class SimulationEngine:
             if day != self._last_day:
                 await self._start_day_locked(day)
             if step != self._last_step and self._day_data:
-                self._last_step = step
-                await self._update_realtime_locked(step)
+                start_step = 0 if self._last_step < 0 else self._last_step + 1
+                for missed_step in range(start_step, step + 1):
+                    self._last_step = missed_step
+                    await self._update_realtime_locked(missed_step)
             self._last_successful_tick_at = datetime.now().astimezone()
             self._last_error = None
 
@@ -278,13 +294,14 @@ class SimulationEngine:
         self._set_node("data_collect", NodeStatus.RUNNING)
         sim_time = self._time.sim_time
         day = int(state.get("day", 0))
-        day_data = generate_day_ahead_data(day, sim_time.month)
+        day_data = generate_day_ahead_data(day, sim_time.month, sim_time.date())
 
         # Correct the source generator's month/day-index rollover and tariff context.
         midnight = datetime.combine(sim_time.date(), datetime.min.time())
         day_data["timestamps"] = [midnight + timedelta(minutes=15 * i) for i in range(POINTS_PER_DAY)]
         day_data["tariff_periods"] = [get_tariff_period(i / 4.0, sim_time.month) for i in range(POINTS_PER_DAY)]
         day_data["price_cny_per_kwh"] = [TARIFF_PRICES[p] for p in day_data["tariff_periods"]]
+        event_impacts = self._apply_disturbances_to_day_data(day_data, sim_time.date())
         self._day_data = day_data
         self._set_node(
             "data_collect",
@@ -292,15 +309,29 @@ class SimulationEngine:
             f"已采集 {len(day_data['load_kw'])} 点数据 ({day_data['season']})",
         )
         self._set_node("data_archive", NodeStatus.RUNNING)
+        data_facts = {
+            "season": day_data["season"],
+            "load_mean_kw": round(sum(day_data["load_kw"]) / 96, 1),
+            "source_date": day_data.get("data_provenance", {}).get("load", {}).get("selected_date"),
+            "event_impacts": event_impacts,
+        }
+        data_content, data_reasoning = await self._reasoning.explain(
+            "data",
+            f"采集季节:{day_data['season']} 负荷均值:{sum(day_data['load_kw'])/96:.0f}kW",
+            data_facts,
+            "解释本日数据质量、血缘和已应用扰动",
+        )
         report = self._add_report(
             AgentType.DATA,
             "日前数据采集报告",
-            f"采集季节:{day_data['season']} 负荷均值:{sum(day_data['load_kw'])/96:.0f}kW",
+            data_content,
             {
                 "season": day_data["season"],
                 "load_mean": sum(day_data["load_kw"]) / 96,
                 "compressor_capability": day_data.get("compressor_capability", {"capability": "monitor_only"}),
                 "data_provenance": day_data.get("data_provenance", {}),
+                "disturbance_impacts": event_impacts,
+                "llm_reasoning": data_reasoning,
             },
             status="approved",
         )
@@ -314,26 +345,54 @@ class SimulationEngine:
     async def _graph_prediction_agent(self, _: EnergySystemState) -> dict[str, Any]:
         assert self._day_data is not None
         self._set_node("prediction", NodeStatus.RUNNING)
-        forecast = self._gen_forecast(self._day_data["load_kw"])
-        self._day_data["load_forecast"] = forecast
-        peak_index = forecast.index(max(forecast))
+        source_resolution = int(
+            self._day_data.get("data_provenance", {}).get("load", {}).get("resolution_minutes", 15)
+        )
+        processed, processing = process_load_to_15min(
+            self._day_data["load_kw"], source_resolution
+        )
+        self._day_data["load_kw"] = processed
+        self._day_data["load_forecast"] = list(processed)
+        self._day_data.setdefault("data_provenance", {})["load_processing"] = processing
+        peak_index = processed.index(max(processed))
+        prediction_facts = {
+            "peak_kw": round(max(processed), 1),
+            "mean_kw": round(sum(processed) / 96, 1),
+            "peak_step": peak_index,
+            "processing": processing,
+        }
+        prediction_content, prediction_reasoning = await self._reasoning.explain(
+            "prediction",
+            f"负荷已处理为15分钟粒度，峰值{max(processed):.0f}kW，均值{sum(processed)/96:.0f}kW",
+            prediction_facts,
+            "说明负荷粒度处理结果及当前不做未来预测的边界",
+        )
         report = self._add_report(
             AgentType.PREDICTION,
-            "日前负荷预测报告",
-            f"预测峰值{max(forecast):.0f}kW，均值{sum(forecast)/96:.0f}kW",
+            "日前负荷处理报告",
+            prediction_content,
             {
-                "forecast_kw": forecast,
-                "peak": max(forecast),
-                "mean": sum(forecast) / 96,
+                "forecast_kw": processed,
+                "peak": max(processed),
+                "mean": sum(processed) / 96,
                 "peak_step": peak_index,
-                "reason": "基于校准负荷基线、排班、气象修正与受控随机误差",
+                "processing": processing,
+                "reason": "当前版本仅做负荷质量校验与时间粒度转换，不生成未来负荷预测",
+                "llm_reasoning": prediction_reasoning,
+                "report_detail": self._build_report_detail("forecast", {
+                    "forecast_kw": processed,
+                    "peak": max(processed),
+                    "mean": sum(processed) / 96,
+                    "peak_step": peak_index,
+                    "processing": processing,
+                }),
             },
         )
-        self._set_node("prediction", NodeStatus.COMPLETED, f"负荷预测报告 {report.report_id} 待审批")
+        self._set_node("prediction", NodeStatus.COMPLETED, f"负荷处理报告 {report.report_id} 待审批")
         return {
             "prediction_result": {"report_id": report.report_id, "report_hash": report.content_hash},
             "current_node": "prediction_agent",
-            "events": {"type": "forecast_created", "report_id": report.report_id},
+            "events": {"type": "load_processed", "report_id": report.report_id},
         }
 
     async def _graph_forecast_approval(self, state: EnergySystemState) -> dict[str, Any]:
@@ -356,12 +415,30 @@ class SimulationEngine:
             carbon_factors=self._carbon_data["c_factors"],
             objective="min_cost",
             solar_kw=self._day_data["solar_kw"],
+            max_power_kw_series=self._day_data.get("storage_power_limit_kw"),
         )
+        storage_facts = {
+            "saving_cny": self._storage_plan["saving_cny"],
+            "terminal_soc": self._storage_plan["terminal_soc"],
+            "max_temp_c": self._storage_plan["max_temp_c"],
+            "solver_status": self._storage_plan["solver_status"],
+            "violations": self._storage_plan.get("violations", []),
+        }
+        storage_content, storage_reasoning = await self._reasoning.explain(
+            "storage",
+            f"MILP优化 省{self._storage_plan['saving_cny']:.0f}元，末端SOC{self._storage_plan['terminal_soc']:.2%}",
+            storage_facts,
+            "解释储能优化结果、约束与审批重点",
+        )
+        self._storage_plan["llm_reasoning"] = storage_reasoning
         report = self._add_report(
             AgentType.STORAGE,
             "日前储能调度报告",
-            f"MILP优化 省{self._storage_plan['saving_cny']:.0f}元，末端SOC{self._storage_plan['terminal_soc']:.2%}",
-            self._storage_plan,
+            storage_content,
+            {
+                **self._storage_plan,
+                "report_detail": self._build_report_detail("storage", self._storage_plan),
+            },
         )
         self._set_node("storage_dispatch", NodeStatus.COMPLETED, f"储能报告 {report.report_id} 待审批")
         return {
@@ -378,12 +455,29 @@ class SimulationEngine:
             self._day_data["weather"]["temp_c"],
             self._day_data["price_cny_per_kwh"],
             self._day_data["tariff_periods"],
+            available_chillers=self._day_data.get("available_chillers"),
         )
+        hvac_facts = {
+            "saving_cny": self._hvac_plan["saving_cny"],
+            "avg_cop": self._hvac_plan["avg_cop"],
+            "violations": self._hvac_plan.get("violations", []),
+            "minimum_available_chillers": min(self._hvac_plan.get("available_chillers", [0])),
+        }
+        hvac_content, hvac_reasoning = await self._reasoning.explain(
+            "hvac",
+            f"冷机调度 省{self._hvac_plan['saving_cny']:.0f}元，平均COP{self._hvac_plan['avg_cop']:.1f}",
+            hvac_facts,
+            "解释冷机调度结果、设备可用性和容量风险",
+        )
+        self._hvac_plan["llm_reasoning"] = hvac_reasoning
         report = self._add_report(
             AgentType.HVAC,
             "日前HVAC调度报告",
-            f"冷机调度 省{self._hvac_plan['saving_cny']:.0f}元，平均COP{self._hvac_plan['avg_cop']:.1f}",
-            self._hvac_plan,
+            hvac_content,
+            {
+                **self._hvac_plan,
+                "report_detail": self._build_report_detail("hvac", self._hvac_plan),
+            },
         )
         self._set_node("hvac_dispatch", NodeStatus.COMPLETED, f"HVAC报告 {report.report_id} 待审批")
         return {
@@ -433,10 +527,22 @@ class SimulationEngine:
 
     async def _graph_monitor_agent(self, _: EnergySystemState) -> dict[str, Any]:
         self._set_node("monitor", NodeStatus.COMPLETED, "审批链完整，物理调度已激活")
+        monitor_content, monitor_reasoning = await self._reasoning.explain(
+            "monitor",
+            "预测、储能和 HVAC 报告绑定校验通过，允许进入模拟物理执行闭环",
+            {
+                "dispatch_enabled": self._dispatch_enabled,
+                "storage_gate": self._approval_gates["storage_approval"].status,
+                "hvac_gate": self._approval_gates["hvac_approval"].status,
+                "unacknowledged_alerts": len([item for item in self._alerts if not item.acknowledged]),
+            },
+            "说明审批联锁、执行资格和剩余风险",
+        )
         report = self._add_report(
             AgentType.MONITOR,
             "调度激活监察报告",
-            "预测、储能和 HVAC 报告绑定校验通过，允许进入模拟物理执行闭环",
+            monitor_content,
+            {"llm_reasoning": monitor_reasoning},
             status="approved",
         )
         return {
@@ -489,9 +595,17 @@ class SimulationEngine:
         gate.comment = comment
         gate.decided_by = actor
         gate.decided_at = self._time.sim_time
-        gate.status = NodeStatus.APPROVED if decision == "approve" else NodeStatus.REJECTED
+        gate.status = (
+            NodeStatus.APPROVED if decision == "approve"
+            else NodeStatus.PENDING_APPROVAL if decision == "revise"
+            else NodeStatus.REJECTED
+        )
         if gate.report:
-            gate.report.status = "approved" if decision == "approve" else "rejected"
+            gate.report.status = (
+                "approved" if decision == "approve"
+                else "pending" if decision == "revise"
+                else "rejected"
+            )
             self._archive.archive_report(
                 gate.report,
                 self._time.sim_time.date(),
@@ -500,7 +614,13 @@ class SimulationEngine:
             )
         self._archive.archive_approval(gate, self._time.sim_time.date(), self._run_id)
 
-        if decision != "approve":
+        if decision == "revise":
+            self._dispatch_enabled = False
+            self._workflow_state["workflow_status"] = "revision_requested"
+            self._workflow_state["current_node"] = gate_id
+            return gate
+
+        if decision == "reject":
             self._dispatch_enabled = False
             self._workflow_state["workflow_status"] = "rejected"
             self._workflow_state["current_node"] = gate_id
@@ -563,6 +683,8 @@ class SimulationEngine:
                 if self._approval_gates[gate_id].status != NodeStatus.APPROVED:
                     raise ApprovalConflict(f"{system} 调度报告尚未批准，拒绝物理设定")
                 self._validate_physical_action(system, target, value)
+            elif target.strip().lower() != "demand_cap_kw":
+                raise InvalidControlAction("园区策略当前仅支持 demand_cap_kw")
 
             record = ControlActionRecord(
                 action_id=f"act-{uuid.uuid4().hex[:12]}",
@@ -587,6 +709,7 @@ class SimulationEngine:
                 # Latest validated operator setpoint wins for that subsystem.
                 self._pending_overrides[system] = record
             else:
+                self._demand_cap_kw = value if value > 0 else None
                 self._archive.archive_control_action(
                     record,
                     self._time.sim_time.date(),
@@ -595,8 +718,7 @@ class SimulationEngine:
                 )
             return record
 
-    @staticmethod
-    def _validate_physical_action(system: str, target: str, value: float) -> None:
+    def _validate_physical_action(self, system: str, target: str, value: float) -> None:
         key = target.strip().lower()
         if system == "storage":
             if key not in {"power", "power_kw", "storage_power_kw", "目标功率"}:
@@ -607,6 +729,10 @@ class SimulationEngine:
             )
             if abs(value) > max_power:
                 raise InvalidControlAction(f"储能功率必须位于 ±{max_power:g} kW")
+            previous = float(self._current_values.get("storage_power_kw", 0.0))
+            max_ramp = float(STORAGE_DEFAULTS["max_ramp_kw_per_step"])
+            if abs(value - previous) > max_ramp:
+                raise InvalidControlAction(f"储能功率变化不得超过单步爬坡边界 {max_ramp:g} kW")
         else:
             power_targets = {"power", "power_kw", "hvac_power_kw", "目标功率"}
             supply_targets = {"supply_temp", "supply_temp_c", "供水温度"}
@@ -615,6 +741,8 @@ class SimulationEngine:
                     raise InvalidControlAction("HVAC 供水温度必须位于 5–12°C")
             elif key not in power_targets:
                 raise InvalidControlAction("当前 HVAC 执行器仅支持 power_kw 或 supply_temp_c")
+            elif value < 0 or value > float(HVAC_DEFAULTS["total_rated_cooling_kw"]) / float(HVAC_DEFAULTS["cop_min"]):
+                raise InvalidControlAction("HVAC 功率越过执行器安全边界")
 
     def get_control_actions(self, limit: int = 30) -> list[dict[str, Any]]:
         bounded = max(1, min(limit, 100))
@@ -631,16 +759,22 @@ class SimulationEngine:
         ts = dd["timestamps"][step]
         load = dd["load_kw"][step] * (1 + self._rng.gauss(0, 0.01))
         solar = dd["solar_kw"][step]
+        previous_storage_power = float(self._current_values.get("storage_power_kw", 0.0))
         storage_power = 0.0
-        soc = 0.5
-        storage_temp = float(STORAGE_DEFAULTS["ambient_temperature_c"])
+        soc = float(self._current_values.get("storage_soc", 0.5))
+        storage_temp = float(self._current_values.get(
+            "storage_temp_c", STORAGE_DEFAULTS["ambient_temperature_c"]
+        ))
         baseline_hvac = (
             self._hvac_plan.get("baseline_power_kw", [])[step]
             if self._hvac_plan and self._hvac_plan.get("baseline_power_kw")
             else dd["hvac_load_kw"][step] / max(float(HVAC_DEFAULTS["cop_nominal"]), 1.0)
         )
-        hvac_power = baseline_hvac
-        hvac_supply = 7.0
+        # Even without approved dispatch the BAS readings are generated at this tick;
+        # they are never copied wholesale from a day-ahead plan.
+        hvac_power = baseline_hvac * (1 + self._rng.gauss(0, 0.004))
+        hvac_supply = float(self._current_values.get("hvac_supply_temp_c", 7.0))
+        hvac_return = float(self._current_values.get("hvac_return_temp_c", 12.0))
         self._last_execution = None
 
         if self._dispatch_enabled and self._storage_plan and self._hvac_plan:
@@ -648,6 +782,14 @@ class SimulationEngine:
             hvac_gate = self._approval_gates["hvac_approval"]
             storage_setpoint = self._storage_plan["power_kw"][step]
             hvac_setpoint = self._hvac_plan["power_kw"][step]
+            hvac_supply_setpoint = self._hvac_plan["supply_temp_c"][step]
+            hvac_return_setpoint = self._hvac_plan["return_temp_c"][step]
+            if self._demand_cap_kw is not None:
+                planned_grid = load - solar - storage_setpoint - (baseline_hvac - hvac_setpoint)
+                storage_setpoint += max(0.0, planned_grid - self._demand_cap_kw)
+                storage_setpoint = min(
+                    float(STORAGE_DEFAULTS["max_discharge_power_kw"]), storage_setpoint
+                )
             pending_actions = list(self._pending_overrides.values())
             for override in pending_actions:
                 target = override.target.lower()
@@ -655,6 +797,8 @@ class SimulationEngine:
                     storage_setpoint = override.value
                 elif "power" in target or "功率" in target:
                     hvac_setpoint = override.value
+                elif "supply" in target or "供水" in target:
+                    hvac_supply_setpoint = override.value
             override_payload = (
                 {"actions": [item.model_dump(mode="json") for item in pending_actions]}
                 if pending_actions
@@ -667,6 +811,12 @@ class SimulationEngine:
                     sim_time=ts,
                     storage_power_kw=storage_setpoint,
                     hvac_power_kw=hvac_setpoint,
+                    hvac_supply_temp_c=hvac_supply_setpoint,
+                    hvac_return_temp_c=hvac_return_setpoint,
+                    previous_storage_power_kw=previous_storage_power,
+                    previous_storage_soc=soc,
+                    previous_storage_temp_c=storage_temp,
+                    ambient_temp_c=float(dd["weather"]["temp_c"][step]),
                     storage_report_id=storage_gate.report_id or "",
                     storage_report_hash=storage_gate.report_hash or "",
                     hvac_report_id=hvac_gate.report_id or "",
@@ -681,14 +831,11 @@ class SimulationEngine:
                 self._command_count += 1
                 storage_power = execution.feedback.measured_storage_power_kw
                 hvac_power = execution.feedback.measured_hvac_power_kw
-                soc = self._storage_plan["soc_ratio"][step]
-                storage_temp = self._storage_plan["temp_c"][step]
-                hvac_supply = self._hvac_plan["supply_temp_c"][step]
+                soc = execution.feedback.measured_storage_soc
+                storage_temp = execution.feedback.measured_storage_temp_c
+                hvac_supply = execution.feedback.measured_hvac_supply_temp_c
+                hvac_return = execution.feedback.measured_hvac_return_temp_c
                 for override in pending_actions:
-                    if override.system == "hvac" and (
-                        "supply" in override.target.lower() or "供水" in override.target
-                    ):
-                        hvac_supply = override.value
                     override.status = "executed"
                     override.applied_step = step
                     override.command_id = execution.command.command_id
@@ -729,6 +876,8 @@ class SimulationEngine:
             "soc": soc * 100,
             "temp": storage_temp,
             "hvac_power": hvac_power,
+            "hvac_supply_temp": hvac_supply,
+            "hvac_return_temp": hvac_return,
             "carbon": c_factor,
             "price": price,
         }
@@ -746,6 +895,7 @@ class SimulationEngine:
             "storage_temp_c": round(storage_temp, 2),
             "hvac_power_kw": round(hvac_power, 1),
             "hvac_supply_temp_c": round(hvac_supply, 1),
+            "hvac_return_temp_c": round(hvac_return, 1),
             "hvac_delta_kw": round(hvac_delta, 1),
             "carbon_factor": round(c_factor, 6),
             "price": round(price, 6),
@@ -758,6 +908,7 @@ class SimulationEngine:
                 **self._current_values,
                 "dispatch_enabled": self._dispatch_enabled,
                 "command_id": self._last_execution.command.command_id if self._last_execution else "",
+                "measurement_source": "simulation_executor" if self._last_execution else "bas_simulator",
             },
             ts.date(),
             self._run_id,
@@ -786,9 +937,16 @@ class SimulationEngine:
         )
 
     def _finalize_day_ahead_accounting(self) -> None:
-        if not self._storage_plan or not self._day_data or not self._carbon_data:
+        if not self._storage_plan or not self._hvac_plan or not self._day_data or not self._carbon_data:
             return
-        optimized_grid = self._storage_plan["grid_kw"]
+        baseline_hvac = self._hvac_plan.get("baseline_power_kw", self._hvac_plan["power_kw"])
+        optimized_hvac = self._hvac_plan["power_kw"]
+        optimized_grid = [
+            max(0.0, self._storage_plan["grid_kw"][step] -
+                (baseline_hvac[step] - optimized_hvac[step]))
+            for step in range(POINTS_PER_DAY)
+        ]
+        self._storage_plan["combined_grid_kw"] = [round(value, 1) for value in optimized_grid]
         self._tariff_data = calculate_tariff(optimized_grid, self._day_data["price_cny_per_kwh"])
         self._carbon_dispatch = account_dispatch_carbon(
             self._carbon_data["c_factors"],
@@ -823,6 +981,82 @@ class SimulationEngine:
             if node.started_at and duration_ms is None:
                 duration_ms = int((now - node.started_at).total_seconds() * 1000)
             node.duration_ms = duration_ms
+
+    def _build_report_detail(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Build one stable, UI-ready report contract for all approval pages."""
+        dd = self._day_data or {}
+        shifts = dd.get("schedule", {}).get("shifts", [])
+        timestamps = dd.get("timestamps", [])
+        loads = dd.get("load_forecast", dd.get("load_kw", []))
+        prices = dd.get("price_cny_per_kwh", [])
+        shift_labels = {"day": "白班", "evening": "晚班", "night": "夜班"}
+        schedule_table = []
+        for step in range(POINTS_PER_DAY):
+            shift = shifts[step] if step < len(shifts) else {"shift": "unknown", "intensity": 0}
+            timestamp = timestamps[step] if step < len(timestamps) else None
+            schedule_table.append({
+                "step": step,
+                "time": timestamp.strftime("%H:%M") if timestamp else f"{step // 4:02d}:{step % 4 * 15:02d}",
+                "shift": shift_labels.get(str(shift.get("shift")), str(shift.get("shift", "—"))),
+                "production_intensity": shift.get("intensity", 0),
+                "load_kw": round(float(loads[step]), 1) if step < len(loads) else None,
+                "price_cny_per_kwh": round(float(prices[step]), 5) if step < len(prices) else None,
+            })
+
+        if kind == "forecast":
+            plan_table = [{
+                "step": row["step"], "time": row["time"], "forecast_kw": row["load_kw"],
+                "shift": row["shift"], "production_intensity": row["production_intensity"],
+            } for row in schedule_table]
+            metrics = [
+                {"label": "峰值负荷", "value": round(float(payload["peak"]), 1), "unit": "kW"},
+                {"label": "平均负荷", "value": round(float(payload["mean"]), 1), "unit": "kW"},
+                {"label": "峰值时刻", "value": schedule_table[int(payload["peak_step"])]["time"], "unit": ""},
+            ]
+            summary = "基于用电负荷_1h.xlsx实际小时数据，已转换为96点日前负荷，并加入小时内零均值扰动。"
+            risks = ["源文件小时值按MW平均功率解释并换算为kW", "15分钟扰动保持每小时电量不变"]
+        elif kind == "storage":
+            plan_table = [{
+                "step": row["step"], "time": row["time"],
+                "power_kw": payload["power_kw"][row["step"]],
+                "soc_ratio": payload["soc_ratio"][row["step"]],
+                "temperature_c": payload["temp_c"][row["step"]],
+                "grid_kw": payload["grid_kw"][row["step"]],
+            } for row in schedule_table]
+            metrics = [
+                {"label": "预计节省", "value": payload["saving_cny"], "unit": "元"},
+                {"label": "峰值削减", "value": payload["peak_reduction_kw"], "unit": "kW"},
+                {"label": "末端SOC", "value": payload["terminal_soc"], "unit": "ratio"},
+                {"label": "最高计划温度", "value": payload["max_temp_c"], "unit": "°C"},
+            ]
+            summary = "储能日前计划已完成容量、SOC、温度、爬坡及末端能量约束校核；实际功率、SOC和温度由实时执行反馈确定。"
+            risks = list(payload.get("violations", []))
+        else:
+            plan_table = [{
+                "step": row["step"], "time": row["time"],
+                "power_kw": payload["power_kw"][row["step"]],
+                "active_chillers": payload["active_chillers"][row["step"]],
+                "cop": payload["cop"][row["step"]],
+                "supply_temp_c": payload["supply_temp_c"][row["step"]],
+                "return_temp_c": payload["return_temp_c"][row["step"]],
+            } for row in schedule_table]
+            metrics = [
+                {"label": "预计节省", "value": payload["saving_cny"], "unit": "元"},
+                {"label": "平均COP", "value": payload["avg_cop"], "unit": ""},
+                {"label": "冷机总数", "value": payload["total_chillers"], "unit": "台"},
+            ]
+            summary = "HVAC日前计划已完成冷机台数、负载率和供回水温度校核；实际功率与温度由BAS实时反馈确定。"
+            risks = list(payload.get("violations", [])) + list(payload.get("model_assumptions", []))
+        return {
+            "version": "1.0",
+            "kind": kind,
+            "situation_summary": summary,
+            "schedule_table": schedule_table,
+            "key_metrics": metrics,
+            "plan_table": plan_table,
+            "risks": risks,
+            "data_provenance": dd.get("data_provenance", {}),
+        }
 
     def _add_report(
         self,
@@ -859,6 +1093,10 @@ class SimulationEngine:
                 return report
         raise LookupError(f"report not found: {report_id}")
 
+    def get_report(self, report_id: str) -> dict[str, Any]:
+        """Public immutable report view used by the dedicated report page."""
+        return self._find_report(report_id).model_dump(mode="json")
+
     def _add_alert(self, severity: Severity, source: str, message: str) -> None:
         existing = [alert for alert in self._alerts if alert.message == message and not alert.acknowledged]
         if existing:
@@ -873,8 +1111,227 @@ class SimulationEngine:
             )
         )
 
-    def _gen_forecast(self, actual_load: list[float]) -> list[float]:
-        return [max(0.0, load * (1 + self._rng.gauss(0, 0.02))) for load in actual_load]
+    async def propose_disturbance(
+        self,
+        *,
+        actor: str,
+        actor_role: str,
+        source_text: str,
+        event_type: str,
+        target: str,
+        start_time: datetime,
+        end_time: datetime | None,
+        parameters: dict[str, Any] | None,
+        summary: str,
+        confidence: float = 1.0,
+        parsed_by: str = "rule_fallback",
+    ) -> DisturbanceEvent:
+        async with self._transition_lock:
+            event = DisturbanceEvent(
+                event_id=f"evt-{uuid.uuid4().hex[:10]}",
+                run_id=self._run_id,
+                actor=actor,
+                actor_role="facility" if actor_role == "facility" else "engineer",
+                source_text=source_text,
+                event_type=event_type,
+                target=target or "园区",
+                start_time=start_time,
+                end_time=end_time,
+                parameters=parameters or {},
+                summary=summary,
+                confidence=confidence,
+                parsed_by=parsed_by,
+                created_at=self._time.sim_time,
+            )
+            self._disturbance_events.insert(0, event)
+            self._disturbance_events = self._disturbance_events[:200]
+            self._archive.archive_disturbance(
+                event, self._time.sim_time.date(), self._run_id
+            )
+            return event
+
+    async def decide_disturbance(
+        self,
+        event_id: str,
+        decision: str,
+        actor: str,
+    ) -> DisturbanceEvent:
+        if decision not in {"apply", "cancel"}:
+            raise ValueError("decision must be apply or cancel")
+        async with self._transition_lock:
+            event = next(
+                (item for item in self._disturbance_events if item.event_id == event_id),
+                None,
+            )
+            if event is None:
+                raise LookupError(f"disturbance not found: {event_id}")
+            if event.status != "proposed":
+                raise ApprovalConflict(f"事件 {event_id} 已处理，当前状态为 {event.status}")
+            event.decided_at = self._time.sim_time
+            event.decided_by = actor
+            if decision == "cancel":
+                event.status = "cancelled"
+                self._archive.archive_disturbance(
+                    event,
+                    self._time.sim_time.date(),
+                    self._run_id,
+                    event_type="disturbance_cancelled",
+                )
+                return event
+
+            event.status = "applied"
+            saved_metrics = dict(self._daily_metrics)
+            saved_series = {key: list(value) for key, value in self._series_cache.items()}
+            saved_values = dict(self._current_values)
+            saved_last_step = self._last_step
+            current_day = self._time.day_count
+            self._prepare_day(current_day)
+            self._daily_metrics = saved_metrics
+            self._series_cache = saved_series
+            self._current_values = saved_values
+            self._last_step = saved_last_step
+            await self._invoke_graph_locked()
+            self._add_alert(
+                Severity.WARNING,
+                "disturbance",
+                f"已应用事件并重算负荷处理链：{event.summary}",
+            )
+            self._archive.archive_disturbance(
+                event,
+                self._time.sim_time.date(),
+                self._run_id,
+                event_type="disturbance_applied_and_replanned",
+            )
+            return event
+
+    def get_disturbance_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        bounded = max(1, min(limit, 200))
+        return [item.model_dump(mode="json") for item in self._disturbance_events[:bounded]]
+
+    def coordinate_agents(
+        self,
+        objective: str,
+        requested_agents: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run deterministic specialist assessments selected from a facility objective."""
+        allowed = ["data_agent", "storage_agent", "hvac_agent", "monitor_agent"]
+        requested = [item for item in (requested_agents or []) if item in allowed]
+        selected = requested or allowed
+        state = self.get_state()
+        pending = [key for key, gate in state["approval_gates"].items()
+                   if gate["status"] == NodeStatus.PENDING_APPROVAL]
+        source = state.get("data_provenance", {}).get("load", {})
+        findings = {
+            "data_agent": (
+                "数据Agent", f"核对负荷源{Path(str(source.get('path', ''))).name or '未知'}；"
+                f"当前样本日{source.get('selected_date', '未知')}，目标粒度15分钟。"
+            ),
+            "storage_agent": (
+                "储能Agent", f"当前SOC {state['storage_soc']:.1%}、功率{state['storage_power_kw']:.0f}kW；"
+                "建议依据实时SOC/温度反馈滚动修正，禁止直接采用日前状态轨迹。"
+            ),
+            "hvac_agent": (
+                "HVAC Agent", f"当前功率{state['hvac_power_kw']:.0f}kW、供水{state['hvac_supply_temp_c']:.1f}°C；"
+                "建议结合冷机可用数、实时供回水温和电价执行温度重置。"
+            ),
+            "monitor_agent": (
+                "监察Agent", f"待审批{len(pending)}项、未确认告警"
+                f"{len([item for item in state['alerts'] if not item['acknowledged']])}项；"
+                "物理动作继续受审批绑定和安全边界联锁。"
+            ),
+        }
+        return [
+            {"agent": agent, "label": findings[agent][0], "objective": objective,
+             "finding": findings[agent][1], "status": "completed"}
+            for agent in selected
+        ]
+
+    def _apply_disturbances_to_day_data(
+        self,
+        day_data: dict[str, Any],
+        sim_date: date,
+    ) -> list[dict[str, Any]]:
+        original_load = [float(value) for value in day_data["load_kw"]]
+        impacts: list[dict[str, Any]] = []
+        day_start = datetime.combine(sim_date, datetime.min.time())
+        day_end = day_start + timedelta(days=1)
+        day_data.setdefault(
+            "available_chillers",
+            [int(HVAC_DEFAULTS["chiller_count"])] * POINTS_PER_DAY,
+        )
+        day_data.setdefault(
+            "storage_power_limit_kw",
+            [float(STORAGE_DEFAULTS["max_discharge_power_kw"])] * POINTS_PER_DAY,
+        )
+
+        for event in reversed(self._disturbance_events):
+            if event.status != "applied":
+                continue
+            event_end = event.end_time or (event.start_time + timedelta(minutes=15))
+            if event.start_time >= day_end or event_end <= day_start:
+                continue
+            start = max(event.start_time, day_start)
+            end = min(event_end, day_end)
+            start_step = max(0, int((start - day_start).total_seconds() // 900))
+            end_step = min(
+                POINTS_PER_DAY,
+                max(start_step + 1, int(((end - day_start).total_seconds() + 899) // 900)),
+            )
+            params = event.parameters
+            target_key = event.target.lower()
+            labels: list[str] = []
+
+            if event.event_type == "equipment_failure":
+                unavailable_units = max(1, int(float(params.get("unavailable_units", 1))))
+                if "冷机" in target_key or "hvac" in target_key or "制冷" in target_key:
+                    for step in range(start_step, end_step):
+                        day_data["available_chillers"][step] = max(
+                            0, int(day_data["available_chillers"][step]) - unavailable_units
+                        )
+                    labels.append(f"冷机可用数 -{unavailable_units}")
+                if "储能" in target_key or "电池" in target_key:
+                    residual = max(0.0, float(params.get("remaining_power_kw", 0.0)))
+                    for step in range(start_step, end_step):
+                        day_data["storage_power_limit_kw"][step] = min(
+                            day_data["storage_power_limit_kw"][step], residual
+                        )
+                    labels.append(f"储能功率上限 {residual:.0f}kW")
+
+            load_delta = float(params.get("load_delta_kw", 0.0))
+            load_multiplier = float(params.get("load_multiplier", 1.0))
+            if load_delta or load_multiplier != 1.0:
+                for step in range(start_step, end_step):
+                    day_data["load_kw"][step] = max(
+                        0.0, day_data["load_kw"][step] * load_multiplier + load_delta
+                    )
+                labels.append(f"负荷 ×{load_multiplier:.3g} {load_delta:+.0f}kW")
+
+            temperature_delta = float(params.get("temperature_delta_c", 0.0))
+            if temperature_delta:
+                for step in range(start_step, end_step):
+                    day_data["weather"]["temp_c"][step] += temperature_delta
+                labels.append(f"室外温度 {temperature_delta:+.1f}°C")
+
+            price_multiplier = float(params.get("price_multiplier", 1.0))
+            if price_multiplier != 1.0:
+                for step in range(start_step, end_step):
+                    day_data["price_cny_per_kwh"][step] *= price_multiplier
+                labels.append(f"电价 ×{price_multiplier:.3g}")
+
+            impact = {
+                "event_id": event.event_id,
+                "steps": [start_step, end_step - 1],
+                "summary": "；".join(labels) if labels else "已记录运行事件，缺少定量影响参数",
+            }
+            event.impact_summary = impact["summary"]
+            impacts.append(impact)
+
+        # Keep the thermal-load share consistent when a production-load event changes demand.
+        for step, before in enumerate(original_load):
+            if before > 0 and day_data["load_kw"][step] != before:
+                day_data["hvac_load_kw"][step] *= day_data["load_kw"][step] / before
+        day_data["event_impacts"] = impacts
+        return impacts
 
     def get_state(self) -> dict[str, Any]:
         dd = self._day_data or {}
@@ -909,6 +1366,15 @@ class SimulationEngine:
             "chiller_topology": get_chiller_topology(),
             "weather": self._current_weather(),
             "data_provenance": dd.get("data_provenance", {}),
+            "data_timeline": {
+                "start": self._data_start.isoformat() if self._data_start else None,
+                "end": self._data_end.isoformat() if self._data_end else None,
+                "current_source_date": dd.get("data_provenance", {}).get("load", {}).get("selected_date"),
+                "resolution_minutes": 15,
+                "provenance": self._data_range_provenance,
+            },
+            "disturbances": self.get_disturbance_events(),
+            "agent_llm": self._reasoning.status(),
             "workflow": {
                 "run_id": self._run_id,
                 "status": self._workflow_state.get("workflow_status", "idle"),
@@ -920,6 +1386,10 @@ class SimulationEngine:
                 "command_count": self._command_count,
             },
             "control_actions": self.get_control_actions(),
+            "active_strategy": {
+                "demand_cap_kw": self._demand_cap_kw,
+                "enabled": self._demand_cap_kw is not None,
+            },
         }
 
     def _current_weather(self) -> dict[str, float]:
@@ -968,6 +1438,7 @@ class SimulationEngine:
             else None,
             "started_at": self._started_at.isoformat(),
             "workflow_status": self._workflow_state.get("workflow_status", "idle"),
+            "agent_llm": self._reasoning.status(),
         }
 
     async def _broadcast_once(self) -> None:

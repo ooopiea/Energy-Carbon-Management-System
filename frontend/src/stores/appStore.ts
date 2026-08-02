@@ -1,6 +1,6 @@
 /** Zustand 全局状态管理：WebSocket 实时同步 + API 操作。 */
 import { create } from 'zustand'
-import type { ActionRecord, ContextSelection, ControlActionPayload, ControlActionRecord, RuntimeState, GraphTopology } from '../types'
+import type { ActionRecord, ChatMessage, ContextSelection, ControlActionPayload, ControlActionRecord, LlmStatus, RuntimeState, GraphTopology } from '../types'
 
 const API_BASE = import.meta.env.DEV ? 'http://127.0.0.1:8000' : ''
 const ACTION_STORAGE_KEY = 'huanghua-energy-action-records'
@@ -20,6 +20,7 @@ interface AppStore {
   selectedNodeId: string | null
   contextSelection: ContextSelection | null
   selectedReportId: string | null
+  reportReturnPage: string
   wsConnected: boolean
   connectionState: 'connecting' | 'connected' | 'reconnecting' | 'offline'
   loadState: 'idle' | 'loading' | 'ready' | 'error'
@@ -27,18 +28,25 @@ interface AppStore {
   actionRecords: ActionRecord[]
   controlActions: ControlActionRecord[]
   operationMessage: { kind: 'success' | 'error'; text: string } | null
+  chatMessages: ChatMessage[]
+  chatLoading: boolean
+  chatRole: 'engineer' | 'facility'
+  llmStatus: LlmStatus | null
 
   setActivePage: (page: string) => void
   toggleRightPanel: () => void
   setSelectedNode: (id: string | null) => void
   setContextSelection: (selection: ContextSelection | null) => void
   setSelectedReport: (id: string | null) => void
+  openReport: (id: string) => void
+  closeReport: () => void
   setState: (s: RuntimeState) => void
   setGraph: (g: GraphTopology) => void
   setWsConnected: (v: boolean) => void
   setConnectionState: (v: AppStore['connectionState']) => void
   recordAction: (action: string, target: string, result: ActionRecord['result'], detail?: string) => void
   clearOperationMessage: () => void
+  setChatRole: (role: 'engineer' | 'facility') => void
 
   fetchState: () => Promise<void>
   fetchGraph: () => Promise<void>
@@ -49,6 +57,10 @@ interface AppStore {
   acknowledgeAlert: (alertId: string) => Promise<void>
   submitControlAction: (payload: ControlActionPayload) => Promise<ControlActionRecord>
   fetchControlActions: () => Promise<void>
+  fetchChatHistory: () => Promise<void>
+  fetchLlmStatus: () => Promise<void>
+  sendChatMessage: (message: string) => Promise<void>
+  decideDisturbance: (eventId: string, decision: 'apply' | 'cancel') => Promise<void>
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -59,6 +71,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   selectedNodeId: null,
   contextSelection: null,
   selectedReportId: null,
+  reportReturnPage: 'agent_flow',
   wsConnected: false,
   connectionState: 'connecting',
   loadState: 'idle',
@@ -66,12 +79,29 @@ export const useAppStore = create<AppStore>((set, get) => ({
   actionRecords: loadActionRecords(),
   controlActions: [],
   operationMessage: null,
+  chatMessages: [],
+  chatLoading: false,
+  chatRole: 'engineer',
+  llmStatus: null,
 
   setActivePage: (page) => set({ activePage: page, contextSelection: null, selectedReportId: null, rightPanelCollapsed: typeof window !== 'undefined' && window.innerWidth < 1200 ? true : get().rightPanelCollapsed }),
   toggleRightPanel: () => set((s) => ({ rightPanelCollapsed: !s.rightPanelCollapsed })),
   setSelectedNode: (id) => set({ selectedNodeId: id }),
   setContextSelection: (selection) => set({ contextSelection: selection, rightPanelCollapsed: selection && typeof window !== 'undefined' && window.innerWidth < 1200 ? false : get().rightPanelCollapsed }),
   setSelectedReport: (id) => set({ selectedReportId: id }),
+  openReport: (id) => set((state) => ({
+    selectedReportId: id,
+    reportReturnPage: state.activePage === 'report' ? state.reportReturnPage : state.activePage,
+    activePage: 'report',
+    rightPanelCollapsed: true,
+  })),
+  closeReport: () => set((state) => ({
+    activePage: state.reportReturnPage,
+    selectedReportId: null,
+    // Reports use the full workspace and temporarily hide the action drawer.
+    // Returning must reveal the approval context again, especially on narrow screens.
+    rightPanelCollapsed: false,
+  })),
   setState: (s) => set({ state: s }),
   setGraph: (g) => set({ graph: g }),
   setWsConnected: (v) => set({ wsConnected: v }),
@@ -82,6 +112,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     return { actionRecords, operationMessage: { kind: result === 'success' ? 'success' : 'error', text: `${action}：${result === 'success' ? '已完成' : '失败'}${detail ? ` · ${detail}` : ''}` } }
   }),
   clearOperationMessage: () => set({ operationMessage: null }),
+  setChatRole: (role) => set({ chatRole: role }),
 
   fetchState: async () => {
     if (get().loadState === 'idle') set({ loadState: 'loading', errorMessage: null })
@@ -185,6 +216,74 @@ export const useAppStore = create<AppStore>((set, get) => ({
     } catch (e) {
       const message = e instanceof Error ? e.message : '控制请求失败'
       get().recordAction(payload.action, payload.target, 'failed', message)
+      throw e
+    }
+  },
+
+  fetchChatHistory: async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/history?session_id=huanghua-main`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const body = await res.json()
+      set({ chatMessages: body.messages ?? [], llmStatus: body.llm ?? null })
+    } catch (e) {
+      console.error('fetchChatHistory error', e)
+    }
+  },
+
+  fetchLlmStatus: async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/llm/status`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      set({ llmStatus: await res.json() })
+    } catch (e) {
+      console.error('fetchLlmStatus error', e)
+    }
+  },
+
+  sendChatMessage: async (message) => {
+    const text = message.trim()
+    if (!text || get().chatLoading) return
+    set({ chatLoading: true })
+    try {
+      const role = get().chatRole
+      const res = await fetch(`${API_BASE}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: text,
+          actor: role === 'facility' ? '厂务值班员' : '值班工程师',
+          actor_role: role,
+          session_id: 'huanghua-main',
+        }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
+      await get().fetchChatHistory()
+      await get().fetchState()
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : '请求失败'
+      get().recordAction('自然语言交互', 'GLM 厂务助手', 'failed', detail)
+      throw e
+    } finally {
+      set({ chatLoading: false })
+    }
+  },
+
+  decideDisturbance: async (eventId, decision) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/disturbances/${eventId}/decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision, actor: get().chatRole === 'facility' ? '厂务值班员' : '值班工程师' }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
+      if (body.state) set({ state: body.state })
+      get().recordAction(decision === 'apply' ? '确认扰动并重算' : '取消扰动', eventId, 'success')
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : '请求失败'
+      get().recordAction(decision === 'apply' ? '确认扰动并重算' : '取消扰动', eventId, 'failed', detail)
       throw e
     }
   },

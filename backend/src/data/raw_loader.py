@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import csv
+import random
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,124 @@ from core.config import DATA_RAW_DIR
 
 
 TIME_LABELS = [f"{minute // 60:02d}:{minute % 60:02d}" for minute in range(0, 1440, 15)]
+
+
+@lru_cache(maxsize=4)
+def get_load_data_range(raw_dir: Path = DATA_RAW_DIR) -> tuple[date | None, date | None, dict[str, Any]]:
+    """Return coverage of the hourly actual-load rows used by the runtime."""
+    path = raw_dir / "daily_load_real" / "total_substation" / "用电负荷_1h.xlsx"
+    if not path.exists():
+        return None, None, _provenance("raw_hourly_load", path, reason="file_missing")
+    try:
+        records = _load_hourly_records(path)
+        if not records:
+            return None, None, _provenance("raw_hourly_load", path, reason="no_valid_hourly_actual_rows")
+        dates = sorted(records)
+        first, last = dates[0], dates[-1]
+        return first, last, _provenance(
+            "raw_hourly_load",
+            path,
+            loaded=True,
+            first_date=first.isoformat(),
+            last_date=last.isoformat(),
+            available_days=len(dates),
+            source_resolution_minutes=60,
+            target_resolution_minutes=15,
+        )
+    except Exception as exc:
+        return None, None, _provenance("raw_hourly_load", path, reason=f"{type(exc).__name__}: {exc}")
+
+
+@lru_cache(maxsize=4)
+def _load_hourly_records(path: Path) -> dict[date, list[float]]:
+    """Read 24-point rows marked ``实际`` from the 1h workbook.
+
+    The first six legacy worksheets contain two-hour samples and are deliberately
+    ignored: using them would silently violate the requested one-hour contract.
+    Hourly values in the ledger are MW averages (the workbook labels them MWh for
+    each one-hour interval), so the runtime converts them to kW.
+    """
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    records: dict[date, list[float]] = {}
+    try:
+        for sheet in workbook.worksheets:
+            header_row: int | None = None
+            for row_index, row in enumerate(
+                sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 12), max_col=28, values_only=True),
+                start=1,
+            ):
+                labels = [str(value).strip() if value is not None else "" for value in row]
+                if "标的日期" in labels and "用户名称" in labels and "1:00" in labels and "24:00" in labels:
+                    header_row = row_index
+                    break
+            if header_row is None:
+                continue
+            current_date: date | None = None
+            for row in sheet.iter_rows(min_row=header_row + 1, max_col=28, values_only=True):
+                parsed = _parse_excel_date(row[0])
+                if parsed is not None:
+                    current_date = parsed
+                label = str(row[2]).strip() if row[2] is not None else ""
+                if label != "实际" or current_date is None:
+                    continue
+                raw_values = row[3:27]
+                if len(raw_values) != 24 or any(value is None for value in raw_values):
+                    continue
+                values_kw = [max(0.0, float(value) * 1000.0) for value in raw_values]
+                if all(value > 0 for value in values_kw):
+                    records[current_date] = values_kw
+    finally:
+        workbook.close()
+    return records
+
+
+def process_load_to_15min(
+    values: list[float],
+    source_resolution_minutes: int,
+) -> tuple[list[float], dict[str, Any]]:
+    """Validate or energy-preservingly disaggregate interval-average load to 15 minutes.
+
+    This is deliberately a load-processing operation, not a forecast.  For coarse
+    inputs the average of every source interval is preserved after disaggregation.
+    """
+    if source_resolution_minutes < 15 or source_resolution_minutes % 15:
+        raise ValueError("source resolution must be a positive multiple of 15 minutes")
+    expected = 1440 // source_resolution_minutes
+    if len(values) != expected:
+        raise ValueError(f"expected {expected} points for {source_resolution_minutes}-minute data")
+    cleaned = [max(0.0, float(value)) for value in values]
+    if source_resolution_minutes == 15:
+        return cleaned, {
+            "method": "validated_15min_passthrough",
+            "input_points": 96,
+            "output_points": 96,
+            "source_resolution_minutes": 15,
+            "target_resolution_minutes": 15,
+            "energy_preserved": True,
+        }
+
+    quarters_per_source = source_resolution_minutes // 15
+    offsets = [((index + 0.5) / quarters_per_source) - 0.5 for index in range(quarters_per_source)]
+    output: list[float] = []
+    for index, mean in enumerate(cleaned):
+        previous = cleaned[index - 1] if index else mean
+        following = cleaned[index + 1] if index + 1 < len(cleaned) else mean
+        slope = (following - previous) / 2.0
+        block = [max(0.0, mean + slope * offset) for offset in offsets]
+        block_mean = sum(block) / quarters_per_source
+        if block_mean > 0:
+            block = [value * mean / block_mean for value in block]
+        output.extend(block)
+    return output, {
+        "method": "shape_preserving_interval_disaggregation",
+        "input_points": len(cleaned),
+        "output_points": len(output),
+        "source_resolution_minutes": source_resolution_minutes,
+        "target_resolution_minutes": 15,
+        "energy_preserved": True,
+    }
 
 
 def _provenance(source: str, path: Path, **extra: Any) -> dict[str, Any]:
@@ -30,48 +150,72 @@ def load_load_profile(
     target_date: date,
     raw_dir: Path = DATA_RAW_DIR,
 ) -> tuple[list[float] | None, dict[str, Any]]:
-    """读取目标日 96 点园区负荷；找不到精确日期时选同月最近日期。"""
-    path = raw_dir / "daily_load_real" / "total_substation" / "用电负荷参考_15min.xlsx"
+    """Read an hourly actual profile and deterministically disaggregate to 15 min."""
+    path = raw_dir / "daily_load_real" / "total_substation" / "用电负荷_1h.xlsx"
     if not path.exists():
-        return None, _provenance("raw_15min_load", path, reason="file_missing")
+        return None, _provenance("raw_hourly_load", path, reason="file_missing")
     try:
-        from openpyxl import load_workbook
-
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        sheet = workbook["0"]
-        rows = sheet.iter_rows(values_only=True)
-        headers = [str(value) if value is not None else "" for value in next(rows)]
-        date_index = headers.index("日期")
-        time_indexes = [headers.index(label) for label in TIME_LABELS]
-        candidates: list[tuple[date, list[float]]] = []
-        for row in rows:
-            raw_date = row[date_index]
-            if raw_date is None:
-                continue
-            parsed = _parse_excel_date(raw_date)
-            if parsed is None or parsed.month != target_date.month:
-                continue
-            values = [float(row[index]) for index in time_indexes]
-            if len(values) == 96 and all(value >= 0 for value in values):
-                candidates.append((parsed, values))
-        workbook.close()
-        if not candidates:
-            return None, _provenance("raw_15min_load", path, reason="month_not_found")
-        selected_date, values = min(
-            candidates,
-            key=lambda item: (abs((item[0] - target_date).days), item[0]),
+        records = _load_hourly_records(path)
+        if not records:
+            return None, _provenance("raw_hourly_load", path, reason="no_valid_hourly_actual_rows")
+        same_month = [(item_date, values) for item_date, values in records.items()
+                      if item_date.month == target_date.month]
+        candidates = same_month or list(records.items())
+        selected_date, hourly_kw = min(candidates, key=lambda item: (
+            abs((item[0] - target_date).days), item[0]
+        ))
+        processed, processing = process_load_to_15min(hourly_kw, 60)
+        disturbed, disturbance = _add_deterministic_quarter_hour_disturbance(
+            processed, hourly_kw, target_date
         )
-        return values, _provenance(
-            "raw_15min_load",
+        return disturbed, _provenance(
+            "raw_hourly_load",
             path,
             loaded=True,
             selected_date=selected_date.isoformat(),
             exact_date=selected_date == target_date,
+            source_points=24,
             points=96,
             unit="kW",
+            source_unit="MW average (equivalent to MWh per one-hour interval)",
+            source_resolution_minutes=60,
+            resolution_minutes=15,
+            hourly_source_kw=[round(value, 6) for value in hourly_kw],
+            processing=processing,
+            perturbation=disturbance,
         )
     except Exception as exc:  # 数据源损坏时由上层显式降级
-        return None, _provenance("raw_15min_load", path, reason=f"{type(exc).__name__}: {exc}")
+        return None, _provenance("raw_hourly_load", path, reason=f"{type(exc).__name__}: {exc}")
+
+
+def _add_deterministic_quarter_hour_disturbance(
+    values_15min: list[float],
+    hourly_kw: list[float],
+    target_date: date,
+    max_ratio: float = 0.015,
+) -> tuple[list[float], dict[str, Any]]:
+    """Add a reproducible intra-hour disturbance while preserving hourly energy."""
+    rng = random.Random(int(target_date.strftime("%Y%m%d")) + 415)
+    output: list[float] = []
+    observed_max = 0.0
+    for hour, mean_kw in enumerate(hourly_kw):
+        block = list(values_15min[hour * 4:hour * 4 + 4])
+        raw = [rng.uniform(-max_ratio, max_ratio) for _ in range(4)]
+        centered = [value - sum(raw) / 4 for value in raw]
+        disturbed = [max(0.0, value + mean_kw * ratio) for value, ratio in zip(block, centered)]
+        block_mean = sum(disturbed) / 4
+        if block_mean > 0:
+            disturbed = [value * mean_kw / block_mean for value in disturbed]
+        observed_max = max(observed_max, *(abs(value / mean_kw - 1) for value in disturbed if mean_kw))
+        output.extend(disturbed)
+    return output, {
+        "enabled": True,
+        "kind": "deterministic_zero_mean_intra_hour",
+        "seed_basis": target_date.isoformat(),
+        "configured_max_ratio": max_ratio,
+        "max_ratio": round(observed_max, 6),
+        "hourly_energy_preserved": True,
+    }
 
 
 def _parse_excel_date(value: Any) -> date | None:

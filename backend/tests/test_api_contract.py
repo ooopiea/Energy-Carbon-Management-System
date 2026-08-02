@@ -82,3 +82,20 @@ async def test_physical_control_requires_approval_and_enters_next_command(tmp_pa
     assert execution["command"]["storage_power_kw"] == 120.0
     assert execution["command"]["manual_override"]["actions"][0]["action_id"]
     assert history.json()[0]["status"] == "executed"
+
+
+@pytest.mark.asyncio
+async def test_full_approval_report_endpoint_returns_schedule_and_plan(tmp_path):
+    engine = SimulationEngine(archive_root=tmp_path)
+    await engine.start_day(0)
+    report_id = engine.get_state()["approval_gates"]["forecast_approval"]["report_id"]
+    app = create_app(engine=engine, start_background=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/api/reports/{report_id}")
+        missing = await client.get("/api/reports/not-found")
+    assert response.status_code == 200
+    detail = response.json()["data"]["report_detail"]
+    assert len(detail["schedule_table"]) == 96
+    assert len(detail["plan_table"]) == 96
+    assert missing.status_code == 404

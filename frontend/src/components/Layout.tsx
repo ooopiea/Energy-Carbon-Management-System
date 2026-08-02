@@ -3,14 +3,17 @@ import { useAppStore } from '../stores/appStore'
 import {
   Workflow, LayoutDashboard, BatteryCharging, Wind, Pause, Play, RotateCcw,
   Wifi, WifiOff, PanelRightClose, PanelRightOpen, Zap, CheckCircle2, XCircle,
+  MessageSquareText,
 } from 'lucide-react'
 import { OverviewPanel } from '../panels/OverviewPanel'
 import { AgentFlowPanel } from '../panels/AgentFlowPanel'
 import { StoragePanel } from '../panels/StoragePanel'
 import { HVACPanel } from '../panels/HVACPanel'
+import { FacilityChatPanel } from '../panels/FacilityChatPanel'
 
 const NAV_ITEMS = [
   { id: 'overview', label: '综合可视化', icon: LayoutDashboard },
+  { id: 'facility_chat', label: '厂务协同', icon: MessageSquareText },
   { id: 'agent_flow', label: 'Agent 流程', icon: Workflow },
   { id: 'storage', label: '储能系统', icon: BatteryCharging },
   { id: 'hvac', label: 'HVAC 系统', icon: Wind },
@@ -29,7 +32,7 @@ export function statusColor(status: string): string {
 export function statusLabel(status: string): string {
   const map: Record<string, string> = {
     idle: '未开始', running: '运行中', completed: '已完成', pending_approval: '等待审批',
-    approved: '已批准', rejected: '已退回', failed: '异常', warning: '告警', critical: '严重',
+    pending: '待审批', approved: '已批准', rejected: '已退回', failed: '异常', warning: '告警', critical: '严重',
   }
   return map[status] || status
 }
@@ -69,7 +72,7 @@ function DispatchRail() {
   return (
     <div className="dispatch-rail" aria-label={`96点调度轨，当前第 ${step + 1} 点`}>
       <div className="rail-meta">
-        <div><span className="eyebrow">黄花园区 · 200× 仿真</span><strong>{state ? formatTime(state.time.sim_time) : '等待系统时间'}</strong></div>
+        <div><span className="eyebrow">黄花园区 · 数据起点 {state?.data_timeline?.start ?? '读取中'} · 200×</span><strong>{state ? formatTime(state.time.sim_time) : '等待系统时间'}</strong></div>
         <div className="rail-step"><span>当前步</span><strong>{String(step + 1).padStart(2, '0')}</strong><small>/ 96</small></div>
       </div>
       <div className="rail-track" role="img" aria-label="全天分时电价与当前仿真位置">
@@ -121,6 +124,7 @@ export function Layout({ children }: { children: ReactNode }) {
       case 'agent_flow': return <AgentFlowPanel />
       case 'storage': return <StoragePanel />
       case 'hvac': return <HVACPanel />
+      case 'facility_chat': return <FacilityChatPanel />
       default: return <OverviewPanel />
     }
   }

@@ -4,7 +4,7 @@ import { ActionHistory, Card, StatusDot, statusLabel } from '../components/Layou
 import { FileText, CheckCircle2, XCircle, Clock, Eye } from 'lucide-react'
 
 export function AgentFlowPanel() {
-  const { state, approve, selectedNodeId, setSelectedReport, selectedReportId } = useAppStore()
+  const { state, approve, selectedNodeId, openReport } = useAppStore()
   const [comments, setComments] = useState<Record<string, string>>({})
   const [busyGate, setBusyGate] = useState<string | null>(null)
   if (!state) return <div className="panel-stack"><p className="empty-copy">等待 Agent 状态</p></div>
@@ -12,7 +12,6 @@ export function AgentFlowPanel() {
   const selectedRuntimeId: Record<string, string> = { data_agent: 'data_collect', prediction_agent: 'prediction', storage_agent: 'storage_dispatch', hvac_agent: 'hvac_dispatch', monitor_agent: 'monitor' }
   const selectedAgent = selectedNodeId ? state.agent_nodes[selectedRuntimeId[selectedNodeId]] : null
   const selectedGate = selectedNodeId ? state.approval_gates[selectedNodeId] : null
-  const selectedReport = state.reports.find(r => r.report_id === selectedReportId)
 
   const decide = async (id: string, decision: 'approve' | 'reject') => {
     const comment = comments[id]?.trim() || ''
@@ -56,12 +55,11 @@ export function AgentFlowPanel() {
       <Card title="Agent 报告" icon={<FileText className="icon-sm industrial" />}>
         <div className="p-2 space-y-1.5 max-h-72 overflow-y-auto">
           {state.reports.length === 0 && <p className="empty-copy">本轮尚未生成报告</p>}
-          {state.reports.map(r => <button key={r.report_id} onClick={() => setSelectedReport(r.report_id)} className="w-full rounded border border-slate-200 bg-white p-2 text-left hover:border-cyan-600">
+          {state.reports.map(r => <button key={r.report_id} onClick={() => openReport(r.report_id)} className="w-full rounded border border-slate-200 bg-white p-2 text-left hover:border-cyan-600">
             <span className="flex items-center justify-between gap-2"><strong className="text-[11px] text-slate-700">{r.title}</strong><Eye className="h-3.5 w-3.5 text-slate-400" /></span><small className="text-[9px] text-slate-400">{new Date(r.created_at).toLocaleString('zh-CN')} · {r.status}</small>
           </button>)}
         </div>
       </Card>
-      {selectedReport && <Card title="报告详情" icon={<FileText className="icon-sm industrial" />}><article className="p-3"><h4 className="m-0 text-sm text-slate-800">{selectedReport.title}</h4><p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{selectedReport.content}</p><details className="text-[10px] text-slate-500"><summary>结构化数据</summary><pre className="overflow-auto whitespace-pre-wrap">{JSON.stringify(selectedReport.data, null, 2)}</pre></details></article></Card>}
       <ActionHistory />
     </div>
   )

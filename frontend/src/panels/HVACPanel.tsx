@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import { useAppStore } from '../stores/appStore'
+import { NaturalLanguagePrompt } from '../components/NaturalLanguagePrompt'
 import { ActionHistory, Card } from '../components/Layout'
 import { Wind, SlidersHorizontal, Crosshair } from 'lucide-react'
+import { ApprovalReportButton } from '../components/ApprovalReportButton'
 
 export function HVACPanel() {
   const { state, contextSelection, submitControlAction } = useAppStore()
@@ -21,7 +23,9 @@ export function HVACPanel() {
     } catch { /* 409/422/网络错误由 store 转换为明确反馈 */ } finally { setBusy(false) }
   }
   return <div className="panel-stack">
-    <Card title={contextSelection?.page === 'hvac' ? contextSelection.label : 'HVAC 实时参数'} icon={<Wind className="icon-sm industrial" />}><div className="data-list"><Row label="运行功率" value={`${(state.hvac_power_kw / 1000).toFixed(1)} MW`} /><Row label="供水温度" value={`${state.hvac_supply_temp_c.toFixed(1)} °C`} /><Row label="回水温度" value={`${hs?.return_temp_c[state.time.step]?.toFixed(1) || '—'} °C`} /><Row label="室外温度" value={`${state.weather.temp_c.toFixed(1)} °C`} /><Row label="当前 COP" value={hs?.cop[state.time.step]?.toFixed(2) || '—'} />{contextSelection?.page === 'hvac' && Object.entries(contextSelection.detail || {}).map(([k,v]) => <Row key={k} label={k} value={String(v)} />)}</div></Card>
+    <NaturalLanguagePrompt placeholder="例如：今天 10:30 3号冷机故障，预计 2 小时恢复…" />
+    <Card title="HVAC 审批报告"><ApprovalReportButton gateId="hvac_approval" /></Card>
+    <Card title={contextSelection?.page === 'hvac' ? contextSelection.label : 'HVAC 实时参数'} icon={<Wind className="icon-sm industrial" />}><div className="data-list"><Row label="运行功率" value={`${(state.hvac_power_kw / 1000).toFixed(1)} MW`} /><Row label="供水温度" value={`${state.hvac_supply_temp_c.toFixed(1)} °C`} /><Row label="回水温度" value={`${state.hvac_return_temp_c.toFixed(1)} °C`} /><Row label="室外温度" value={`${state.weather.temp_c.toFixed(1)} °C`} /><Row label="当前计划 COP" value={hs?.cop[state.time.step]?.toFixed(2) || '—'} />{contextSelection?.page === 'hvac' && Object.entries(contextSelection.detail || {}).map(([k,v]) => <Row key={k} label={k} value={String(v)} />)}</div></Card>
     {contextSelection?.kind === 'point' && contextSelection.page === 'hvac' && <Card title="曲线数据点" icon={<Crosshair className="icon-sm industrial" />}><div className="data-list">{Object.entries(contextSelection.detail || {}).map(([k, v]) => <Row key={k} label={k} value={String(v)} />)}</div></Card>}
     <Card title="控制设定" icon={<SlidersHorizontal className="icon-sm industrial" />}><div className="form-grid"><label>运行模式<select value={mode} onChange={e => setMode(e.target.value)}><option value="auto">自动优化</option><option value="comfort">工艺温控优先</option><option value="cost">电费优先</option></select></label><label>供水温度（°C）<input type="number" step="0.1" min="5" max="12" value={supply} onChange={e => setSupply(e.target.value)} /></label><label>回水温度上限（°C）<input type="number" step="0.1" min="7" max="18" value={returnLimit} onChange={e => setReturnLimit(e.target.value)} /></label><button disabled={busy} className="btn primary" onClick={submit}>{busy ? '提交中…' : '确认并下发'}</button></div></Card>
     <ActionHistory />

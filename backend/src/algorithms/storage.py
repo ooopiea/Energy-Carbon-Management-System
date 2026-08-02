@@ -35,6 +35,7 @@ def optimize_storage_dispatch(
     solar_kw: list[float] | None = None,
     billing_peak_floor_kw: float = 0.0,
     demand_price_cny_per_kw_month: float = DEMAND_PRICE_CNY_PER_KW_MONTH,
+    max_power_kw_series: list[float] | None = None,
 ) -> dict[str, Any]:
     """优化储能充放电调度。
 
@@ -66,6 +67,9 @@ def optimize_storage_dispatch(
     max_soc = cfg["max_soc_ratio"]
     max_charge = cfg["max_charge_power_kw"]
     max_discharge = cfg["max_discharge_power_kw"]
+    power_limits = max_power_kw_series or [max(max_charge, max_discharge)] * n
+    if len(power_limits) != n or any(float(value) < 0 for value in power_limits):
+        raise ValueError("max_power_kw_series must be non-negative and match load_kw")
     max_ramp = cfg["max_ramp_kw_per_step"]
     max_temp = cfg["max_cell_temperature_c"]
     eta_ch = cfg["charge_efficiency_ratio"]
@@ -88,8 +92,10 @@ def optimize_storage_dispatch(
     peak = pulp.LpVariable("peak", max(0.0, billing_peak_floor_kw))
 
     for t in range(n):
-        prob += p_ch[t] <= max_charge * charge_mode[t]
-        prob += p_dis[t] <= max_discharge * (1 - charge_mode[t])
+        step_charge = min(max_charge, float(power_limits[t]))
+        step_discharge = min(max_discharge, float(power_limits[t]))
+        prob += p_ch[t] <= step_charge * charge_mode[t]
+        prob += p_dis[t] <= step_discharge * (1 - charge_mode[t])
         prev = initial_soc if t == 0 else soc[t - 1]
         prob += soc[t] == prev + charge_coef * p_ch[t] - discharge_coef * p_dis[t]
 
@@ -191,6 +197,7 @@ def optimize_storage_dispatch(
         "terminal_soc_target": round(target_soc, 4),
         "capacity_kwh": capacity,
         "rated_power_kw": max(max_charge, max_discharge),
+        "available_power_kw": [round(float(value), 1) for value in power_limits],
         "cost_scope": "energy_day_plus_candidate_monthly_demand_peak",
     }
 

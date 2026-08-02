@@ -24,7 +24,11 @@ DATA_RAW_DIR = Path(
 SITE_ID = "huanghua"
 SITE_NAME = "黄花工业园区"
 REGION = "cn-hunan"
-SIMULATION_START_DATE = date(2025, 7, 15)
+# Simulator compatibility anchor. The runtime clock itself is resolved from the
+# earliest date in the load ledger by SimulationEngine.
+SIMULATION_START_DATE = date.fromisoformat(
+    os.getenv("ENERGY_SIMULATION_START_DATE", "2025-07-15")
+)
 
 # 项目参考文件确认的站点资产容量。单位口径必须在全链路保持一致。
 SITE_SOLAR_CAPACITY_KW = 19_100.0

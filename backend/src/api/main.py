@@ -29,6 +29,7 @@ from agents.engine import (
     SimulationEngine,
     get_engine,
 )
+from agents.chat_service import FacilityChatService
 from graph.workflow import get_graph_topology
 
 
@@ -50,6 +51,18 @@ class ControlActionRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=128)
 
 
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    actor: str = Field(default="值班工程师", min_length=1, max_length=128)
+    actor_role: Literal["engineer", "facility"] = "engineer"
+    session_id: str = Field(default="huanghua-main", min_length=1, max_length=128)
+
+
+class DisturbanceDecisionRequest(BaseModel):
+    decision: Literal["apply", "cancel"]
+    actor: str = Field(default="值班工程师", min_length=1, max_length=128)
+
+
 def _allowed_origins() -> list[str]:
     configured = os.getenv("ENERGY_CORS_ORIGINS", "")
     if configured.strip():
@@ -59,6 +72,7 @@ def _allowed_origins() -> list[str]:
 
 def create_app(engine: SimulationEngine | None = None, start_background: bool = True) -> FastAPI:
     runtime_engine = engine or get_engine()
+    chat_service = FacilityChatService(runtime_engine)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -91,6 +105,7 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
         lifespan=lifespan,
     )
     application.state.engine = runtime_engine
+    application.state.chat_service = chat_service
     application.state.simulation_task = None
     application.add_middleware(
         CORSMiddleware,
@@ -109,6 +124,7 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
         result = runtime_engine.health()
         task = application.state.simulation_task
         result["background_task_running"] = bool(task is not None and not task.done())
+        result["llm"] = chat_service.status()
         return result
 
     @application.get("/api/state")
@@ -198,6 +214,46 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
     async def list_control_actions(limit: int = Query(default=30, ge=1, le=100)):
         return runtime_engine.get_control_actions(limit)
 
+    @application.post("/api/chat")
+    async def chat(payload: ChatRequest):
+        result = await chat_service.chat(**payload.model_dump())
+        await runtime_engine.broadcast_state()
+        return result
+
+    @application.get("/api/chat/history")
+    async def chat_history(session_id: str = Query(default="huanghua-main", max_length=128)):
+        return {
+            "session_id": session_id,
+            "messages": chat_service.history(session_id),
+            "llm": chat_service.status(),
+        }
+
+    @application.get("/api/llm/status")
+    async def llm_status():
+        return chat_service.status()
+
+    @application.get("/api/disturbances")
+    async def list_disturbances(limit: int = Query(default=50, ge=1, le=200)):
+        return runtime_engine.get_disturbance_events(limit)
+
+    @application.post("/api/disturbances/{event_id}/decision")
+    async def decide_disturbance(event_id: str, payload: DisturbanceDecisionRequest):
+        try:
+            event = await runtime_engine.decide_disturbance(
+                event_id, payload.decision, payload.actor
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await runtime_engine.broadcast_state()
+        return {
+            "event": event.model_dump(mode="json"),
+            "state": runtime_engine.get_state(),
+        }
+
     @application.post("/api/alerts/{alert_id}/acknowledge")
     async def acknowledge_alert(alert_id: str):
         if not runtime_engine.acknowledge_alert(alert_id):
@@ -216,6 +272,13 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
     @application.get("/api/reports")
     async def get_reports():
         return runtime_engine.get_state()["reports"]
+
+    @application.get("/api/reports/{report_id}")
+    async def get_report(report_id: str):
+        try:
+            return runtime_engine.get_report(report_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @application.get("/api/alerts")
     async def get_alerts():
@@ -249,6 +312,7 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
             "summary": state.get("hvac_summary"),
             "chiller_topology": state.get("chiller_topology"),
             "supply_temp_c": state.get("hvac_supply_temp_c"),
+            "return_temp_c": state.get("hvac_return_temp_c"),
             "power_kw": state.get("hvac_power_kw"),
             "day_ahead_plan": state["day_ahead"].get("hvac_plan", []),
             "dispatch": state["physical_dispatch"],
