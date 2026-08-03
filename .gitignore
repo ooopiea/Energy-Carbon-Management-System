@@ -47,3 +47,6 @@ htmlcov/
 
 # Build artifacts
 backend/data/processed/*.parquet
+
+# Test temp directory
+backend/work/

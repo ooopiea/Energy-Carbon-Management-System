@@ -16,7 +16,6 @@ except ImportError:
     _HAS_PULP = False
 
 from core.config import (
-    DEMAND_PRICE_CNY_PER_KW_MONTH,
     SIM_STEP_MINUTES,
     STORAGE_DEFAULTS,
 )
@@ -34,13 +33,14 @@ def optimize_storage_dispatch(
     terminal_soc: float | None = None,
     solar_kw: list[float] | None = None,
     billing_peak_floor_kw: float = 0.0,
-    demand_price_cny_per_kw_month: float = DEMAND_PRICE_CNY_PER_KW_MONTH,
+    demand_price_cny_per_kw_month: float = 0.0,
     max_power_kw_series: list[float] | None = None,
 ) -> dict[str, Any]:
     """优化储能充放电调度。
 
-    ``min_cost`` 同时考虑电度电费与本日可能形成的月最大需量。默认末端 SOC
-    回到初始 SOC，避免把消耗期初库存误报为节省。光伏按自发自用从园区负荷中扣除。
+    ``min_cost`` 默认只考虑日电度电费与充/放模式切换惩罚；月度需量电费
+    不进入每日收益。调用方仍可显式传入需量单价用于月度协调场景。默认末端
+    SOC 回到初始 SOC，避免把消耗期初库存误报为节省。光伏按自发自用从园区负荷中扣除。
     """
     cfg = {**STORAGE_DEFAULTS, **(battery_config or {})}
     n = len(load_kw)
@@ -60,7 +60,15 @@ def optimize_storage_dispatch(
     base_grid = [max(0.0, float(load_kw[t]) - float(solar[t])) for t in range(n)]
 
     if not _HAS_PULP:
-        return _heuristic_dispatch(base_grid, price_cny_per_kwh, cfg, initial_soc, target_soc, dt_h)
+        return _heuristic_dispatch(
+            base_grid,
+            price_cny_per_kwh,
+            cfg,
+            initial_soc,
+            target_soc,
+            dt_h,
+            demand_price_cny_per_kw_month,
+        )
 
     capacity = cfg["capacity_kwh"]
     min_soc = cfg["min_soc_ratio"]
@@ -74,6 +82,7 @@ def optimize_storage_dispatch(
     max_temp = cfg["max_cell_temperature_c"]
     eta_ch = cfg["charge_efficiency_ratio"]
     eta_dis = cfg["discharge_efficiency_ratio"]
+    switch_penalty = max(0.0, float(cfg.get("mode_switch_penalty_cny", 0.0) or 0.0))
     t_amb = cfg["ambient_temperature_c"]
     r_th = cfg["thermal_resistance_c_per_kw"]
     tau_th = cfg["thermal_time_constant_min"]
@@ -87,6 +96,7 @@ def optimize_storage_dispatch(
     p_ch = [pulp.LpVariable(f"ch_{t}", 0, max_charge) for t in range(n)]
     p_dis = [pulp.LpVariable(f"dis_{t}", 0, max_discharge) for t in range(n)]
     charge_mode = [pulp.LpVariable(f"charge_mode_{t}", cat="Binary") for t in range(n)]
+    mode_switch = [pulp.LpVariable(f"mode_switch_{t}", cat="Binary") for t in range(1, n)]
     soc = [pulp.LpVariable(f"soc_{t}", min_soc, max_soc) for t in range(n)]
     temp = [pulp.LpVariable(f"temp_{t}", 0, max_temp) for t in range(n)]
     peak = pulp.LpVariable("peak", max(0.0, billing_peak_floor_kw))
@@ -98,6 +108,11 @@ def optimize_storage_dispatch(
         prob += p_dis[t] <= step_discharge * (1 - charge_mode[t])
         prev = initial_soc if t == 0 else soc[t - 1]
         prob += soc[t] == prev + charge_coef * p_ch[t] - discharge_coef * p_dis[t]
+
+    for t in range(1, n):
+        switch = mode_switch[t - 1]
+        prob += switch >= charge_mode[t] - charge_mode[t - 1]
+        prob += switch >= charge_mode[t - 1] - charge_mode[t]
 
     for t in range(n):
         prev_p = 0 if t == 0 else p_dis[t - 1] - p_ch[t - 1]
@@ -124,15 +139,16 @@ def optimize_storage_dispatch(
         for t in range(n)
     )
     demand_objective = peak * max(0.0, demand_price_cny_per_kw_month)
+    switch_objective = switch_penalty * pulp.lpSum(mode_switch)
 
     if objective == "min_cost":
-        prob += energy_objective + demand_objective
+        prob += energy_objective + demand_objective + switch_objective
     elif objective == "min_carbon":
         prob += pulp.lpSum((-p_dis[t] + p_ch[t]) * cf[t] * dt_h for t in range(n))
     elif objective == "limit_peak":
         prob += peak
     elif objective == "combined":
-        prob += energy_objective + demand_objective
+        prob += energy_objective + demand_objective + switch_objective
     else:
         raise ValueError(f"unsupported objective: {objective}")
 
@@ -143,11 +159,21 @@ def optimize_storage_dispatch(
 
     status = pulp.LpStatus[prob.status]
     if prob.status != pulp.LpStatusOptimal:
-        return _heuristic_dispatch(base_grid, price_cny_per_kwh, cfg, initial_soc, target_soc, dt_h)
+        return _heuristic_dispatch(
+            base_grid,
+            price_cny_per_kwh,
+            cfg,
+            initial_soc,
+            target_soc,
+            dt_h,
+            demand_price_cny_per_kw_month,
+        )
 
     p_ch_v = [float(pulp.value(v) or 0) for v in p_ch]
     p_dis_v = [float(pulp.value(v) or 0) for v in p_dis]
     power = [p_dis_v[t] - p_ch_v[t] for t in range(n)]
+    mode_switch_count = _count_mode_switches(power)
+    mode_switch_cost = mode_switch_count * switch_penalty
 
     soc_v, temp_v = [], []
     s, th = initial_soc, t_amb
@@ -165,7 +191,7 @@ def optimize_storage_dispatch(
     baseline_demand_cost = baseline_peak * max(0.0, demand_price_cny_per_kw_month)
     optimized_demand_cost = optimized_peak * max(0.0, demand_price_cny_per_kw_month)
     baseline_cost = baseline_energy_cost + baseline_demand_cost
-    optimized_cost = optimized_energy_cost + optimized_demand_cost
+    optimized_cost = optimized_energy_cost + optimized_demand_cost + mode_switch_cost
 
     violations = _verify_constraints(
         soc_v, temp_v, power, p_ch_v, p_dis_v, cfg, max_ramp, target_soc
@@ -194,15 +220,31 @@ def optimize_storage_dispatch(
         "solver_status": status,
         "solve_ms": solve_ms,
         "objective": objective,
+        "initial_soc": round(initial_soc, 4),
         "terminal_soc_target": round(target_soc, 4),
         "capacity_kwh": capacity,
         "rated_power_kw": max(max_charge, max_discharge),
         "available_power_kw": [round(float(value), 1) for value in power_limits],
-        "cost_scope": "energy_day_plus_candidate_monthly_demand_peak",
+        "mode_switch_count": mode_switch_count,
+        "mode_switch_penalty_cny": switch_penalty,
+        "mode_switch_cost_cny": round(mode_switch_cost, 2),
+        "cost_scope": (
+            "daily_energy_plus_mode_switch_penalty"
+            if demand_price_cny_per_kw_month <= 0
+            else "energy_plus_explicit_demand_plus_mode_switch_penalty"
+        ),
     }
 
 
-def _heuristic_dispatch(load, price, cfg, init_soc, target_soc, dt_h):
+def _heuristic_dispatch(
+    load,
+    price,
+    cfg,
+    init_soc,
+    target_soc,
+    dt_h,
+    demand_price_cny_per_kw_month,
+):
     """求解器不可用时安全降级为不动作，不伪造节费或违反 SOC。"""
     n = len(load)
     power = [0.0] * n
@@ -210,7 +252,7 @@ def _heuristic_dispatch(load, price, cfg, init_soc, target_soc, dt_h):
     temp_v = [cfg["ambient_temperature_c"]] * n
     grid = list(load)
     baseline_cost = sum(load[t] * price[t] * dt_h for t in range(n))
-    demand_cost = max(load) * DEMAND_PRICE_CNY_PER_KW_MONTH
+    demand_cost = max(load) * max(0.0, demand_price_cny_per_kw_month)
     baseline_cost += demand_cost
     optimized_cost = baseline_cost
     return {
@@ -233,7 +275,37 @@ def _heuristic_dispatch(load, price, cfg, init_soc, target_soc, dt_h):
         "solver_status": "safe_noop_fallback",
         "solve_ms": 0,
         "objective": "min_cost",
+        "initial_soc": round(init_soc, 4),
+        "terminal_soc_target": round(target_soc, 4),
+        "baseline_energy_cost_cny": round(baseline_cost - demand_cost, 2),
+        "optimized_energy_cost_cny": round(optimized_cost - demand_cost, 2),
+        "baseline_demand_cost_cny": round(demand_cost, 2),
+        "optimized_demand_cost_cny": round(demand_cost, 2),
+        "mode_switch_count": 0,
+        "mode_switch_penalty_cny": max(
+            0.0, float(cfg.get("mode_switch_penalty_cny", 0.0) or 0.0)
+        ),
+        "mode_switch_cost_cny": 0.0,
+        "cost_scope": (
+            "daily_energy_plus_mode_switch_penalty"
+            if demand_price_cny_per_kw_month <= 0
+            else "energy_plus_explicit_demand_plus_mode_switch_penalty"
+        ),
     }
+
+
+def _count_mode_switches(power: list[float]) -> int:
+    """Count charge/discharge polarity changes, ignoring idle intervals."""
+    previous_mode = 0
+    switches = 0
+    for value in power:
+        current_mode = 1 if value > _TOL else -1 if value < -_TOL else 0
+        if current_mode == 0:
+            continue
+        if previous_mode and current_mode != previous_mode:
+            switches += 1
+        previous_mode = current_mode
+    return switches
 
 
 def _verify_constraints(soc, temp, power, p_ch, p_dis, cfg, max_ramp, terminal_soc):

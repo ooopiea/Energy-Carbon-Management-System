@@ -47,8 +47,10 @@ STORAGE_DEFAULTS = {
     "max_discharge_power_kw": SITE_STORAGE_POWER_KW,
     "min_soc_ratio": 0.10,
     "max_soc_ratio": 0.90,
-    "charge_efficiency_ratio": 0.95,
-    "discharge_efficiency_ratio": 0.95,
+    "charge_efficiency_ratio": 0.90,
+    "discharge_efficiency_ratio": 0.90,
+    # 轻量正则项：抑制同价值方案中的无意义充/放模式反复切换。
+    "mode_switch_penalty_cny": 10.0,
     "max_ramp_kw_per_step": SITE_STORAGE_POWER_KW,
     "max_cell_temperature_c": 45.0,
     # 工程回退值：额定功率时稳态温升约 8°C；上线前应由 BMS 实测标定。

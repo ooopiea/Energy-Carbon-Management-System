@@ -103,5 +103,21 @@ async def test_reset_clears_runtime_and_starts_fresh_pending_workflow(tmp_path):
         "peak_kw": 0.0,
     }
     assert state["series"] == {}
+    assert state["storage_soc"] == pytest.approx(0.5)
     assert state["physical_dispatch"]["last_execution"] is None
     assert state["approval_gates"]["forecast_approval"]["status"] == "pending_approval"
+
+
+@pytest.mark.asyncio
+async def test_new_day_inherits_previous_actual_storage_soc(tmp_path):
+    engine = SimulationEngine(archive_root=tmp_path)
+    await engine.start_day(0)
+    engine._current_values["storage_soc"] = 0.37
+
+    await engine.start_day(1)
+    assert engine.get_state()["storage_soc"] == pytest.approx(0.37)
+
+    await engine.submit_approval("forecast_approval", "approve", actor="tester")
+    summary = engine.get_state()["storage_summary"]
+    assert summary["initial_soc"] == pytest.approx(0.37)
+    assert summary["terminal_soc_target"] == pytest.approx(0.37)

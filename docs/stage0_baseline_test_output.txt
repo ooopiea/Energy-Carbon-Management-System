@@ -1,0 +1,89 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.14.2, pytest-9.1.1, pluggy-1.6.0 -- D:\python\python.exe
+cachedir: .pytest_cache
+rootdir: D:\ZBY_synchronization\����ʿ��������Ŀ\̼�к�ʵ��\energy_management_v3\v3_energy_management\backend
+configfile: pyproject.toml
+plugins: anyio-4.13.0, langsmith-0.10.10, asyncio-1.4.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 45 items
+
+tests/test_algorithms.py::test_storage_has_fair_terminal_soc_and_mutually_exclusive_modes PASSED [  2%]
+tests/test_algorithms.py::test_storage_daily_saving_excludes_monthly_demand_charge PASSED [  4%]
+tests/test_algorithms.py::test_storage_switch_penalty_discourages_charge_discharge_flipping PASSED [  6%]
+tests/test_algorithms.py::test_hvac_uses_real_registry_scale_without_fictional_ice_storage PASSED [  8%]
+tests/test_algorithms.py::test_tariff_prorates_monthly_demand_charge_for_daily_horizon PASSED [ 11%]
+tests/test_algorithms.py::test_carbon_accounts_for_unclassified_generation PASSED [ 13%]
+tests/test_algorithms.py::test_compressor_stays_monitor_only_without_pressure_data PASSED [ 15%]
+tests/test_api_contract.py::test_approval_api_uses_domain_error_codes PASSED [ 17%]
+tests/test_api_contract.py::test_health_and_reset_api_report_fresh_state PASSED [ 20%]
+tests/test_api_contract.py::test_physical_control_requires_approval_and_enters_next_command PASSED [ 22%]
+tests/test_api_contract.py::test_full_approval_report_endpoint_returns_schedule_and_plan PASSED [ 24%]
+tests/test_data_and_config.py::test_confirmed_site_capacities_and_monthly_periods PASSED [ 26%]
+tests/test_data_and_config.py::test_simulator_is_15_minute_and_reports_provenance PASSED [ 28%]
+tests/test_data_and_config.py::test_cross_month_global_day_index_does_not_double_count_days PASSED [ 31%]
+tests/test_engine_workflow.py::test_pending_approvals_never_execute_dispatch PASSED [ 33%]
+tests/test_engine_workflow.py::test_both_dispatch_approvals_are_required_for_acknowledged_execution PASSED [ 35%]
+tests/test_engine_workflow.py::test_rejected_forecast_cannot_create_or_execute_plans PASSED [ 37%]
+tests/test_engine_workflow.py::test_gate_is_bound_to_archived_report_id_and_hash PASSED [ 40%]
+tests/test_engine_workflow.py::test_reset_clears_runtime_and_starts_fresh_pending_workflow PASSED [ 42%]
+tests/test_engine_workflow.py::test_new_day_inherits_previous_actual_storage_soc PASSED [ 44%]
+tests/test_glm_chat_and_load_processing.py::test_load_processing_preserves_every_hour_energy PASSED [ 46%]
+tests/test_glm_chat_and_load_processing.py::test_runtime_data_range_is_read_from_the_ledger PASSED [ 48%]
+tests/test_glm_chat_and_load_processing.py::test_glm_client_parses_official_tool_call_shape PASSED [ 51%]
+tests/test_glm_chat_and_load_processing.py::test_natural_language_failure_is_confirmed_before_replan PASSED [ 53%]
+tests/test_requirements_regression.py::test_hourly_ledger_is_the_only_load_source_and_is_disaggregated PASSED [ 55%]
+tests/test_requirements_regression.py::test_site_load_scale_dominates_storage_and_solar PASSED [ 57%]
+tests/test_requirements_regression.py::test_realtime_feedback_drives_actual_storage_and_hvac_state PASSED [ 60%]
+tests/test_requirements_regression.py::test_every_approval_report_has_full_report_sections PASSED [ 62%]
+tests/test_requirements_regression.py::test_engineer_receives_project_feedback_and_facility_can_delegate_agents PASSED [ 64%]
+tests/test_requirements_regression.py::test_revision_is_not_mislabeled_as_rejection PASSED [ 66%]
+tests/test_requirements_regression.py::test_skipped_clock_steps_are_replayed_in_order PASSED [ 68%]
+tests/test_requirements_regression.py::test_unsafe_manual_actions_fail_before_the_next_tick PASSED [ 71%]
+tests/test_requirements_regression.py::test_hvac_schedule_responds_to_price_signal PASSED [ 73%]
+tests/test_requirements_regression.py::test_combined_accounting_and_overview_strategy_are_effective PASSED [ 75%]
+tests/test_safety_invariants.py::test_invariant_1_unapproved_dispatch_cannot_execute PASSED [ 77%]
+tests/test_safety_invariants.py::test_invariant_2a_stale_report_id_is_rejected PASSED [ 80%]
+tests/test_safety_invariants.py::test_invariant_2b_stale_report_hash_is_rejected PASSED [ 82%]
+tests/test_safety_invariants.py::test_invariant_2c_executor_rejects_missing_report_binding PASSED [ 84%]
+tests/test_safety_invariants.py::test_invariant_3_proposed_disturbance_does_not_invalidate_plans PASSED [ 86%]
+tests/test_safety_invariants.py::test_invariant_4a_executor_rejects_over_power_storage PASSED [ 88%]
+tests/test_safety_invariants.py::test_invariant_4b_executor_rejects_excessive_ramp PASSED [ 91%]
+tests/test_safety_invariants.py::test_invariant_4c_executor_rejects_out_of_range_supply_temp PASSED [ 93%]
+tests/test_safety_invariants.py::test_invariant_5_acked_command_is_not_re_executed XFAIL [ 95%]
+tests/test_safety_invariants.py::test_invariant_6a_glm_unconfigured_does_not_block_workflow PASSED [ 97%]
+tests/test_safety_invariants.py::test_invariant_6b_glm_error_falls_back_gracefully PASSED [100%]
+
+============================== warnings summary ===============================
+..\..\..\..\..\..\python\Lib\site-packages\starlette\formparsers.py:12
+  D:\python\Lib\site-packages\starlette\formparsers.py:12: PendingDeprecationWarning: Please use `import python_multipart` instead.
+    import multipart
+
+..\..\..\..\..\..\python\Lib\site-packages\fastapi\routing.py:211: 28 warnings
+tests/test_api_contract.py: 112 warnings
+  D:\python\Lib\site-packages\fastapi\routing.py:211: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    is_coroutine = asyncio.iscoroutinefunction(dependant.call)
+
+tests/test_algorithms.py: 240 warnings
+tests/test_api_contract.py: 1152 warnings
+tests/test_engine_workflow.py: 2304 warnings
+tests/test_glm_chat_and_load_processing.py: 576 warnings
+tests/test_requirements_regression.py: 2880 warnings
+tests/test_safety_invariants.py: 2304 warnings
+  D:\python\Lib\site-packages\pulp\pulp.py:318: DeprecationWarning: Constructing LpVariable(name, ...) directly is deprecated; in PuLP 4.0 use prob.add_variable(name, lowBound, upBound, cat=...). Variables are then attached to the model when created.
+    _v4_deprecation(msg, stacklevel=2)
+
+tests/test_algorithms.py: 4 warnings
+tests/test_api_contract.py: 2 warnings
+tests/test_engine_workflow.py: 4 warnings
+tests/test_glm_chat_and_load_processing.py: 1 warning
+tests/test_requirements_regression.py: 5 warnings
+tests/test_safety_invariants.py: 4 warnings
+  D:\python\Lib\site-packages\pulp\apis\coin_api.py:70: DeprecationWarning: PULP_CBC_CMD is deprecated and will be removed in PuLP 4.0. Install CBC with `pip install pulp[cbc]` and use COIN_CMD instead.
+    v4_deprecation(PULP_CBC_CMD_DEPRECATION_MSG, stacklevel=stacklevel)
+
+tests/test_api_contract.py: 16 warnings
+  D:\python\Lib\site-packages\starlette\_utils.py:42: DeprecationWarning: 'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead
+    return asyncio.iscoroutinefunction(obj) or (
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================ 44 passed, 1 xfailed, 9633 warnings in 16.59s ================

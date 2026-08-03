@@ -4,6 +4,7 @@ from core.config import (
     SITE_SOLAR_CAPACITY_KW,
     SITE_STORAGE_CAPACITY_KWH,
     SITE_STORAGE_POWER_KW,
+    STORAGE_DEFAULTS,
     build_period_map,
 )
 from data.simulator import DataSimulator
@@ -13,6 +14,9 @@ def test_confirmed_site_capacities_and_monthly_periods() -> None:
     assert SITE_SOLAR_CAPACITY_KW == 19_100
     assert SITE_STORAGE_POWER_KW == 15_000
     assert SITE_STORAGE_CAPACITY_KWH == 30_000
+    assert STORAGE_DEFAULTS["charge_efficiency_ratio"] == 0.90
+    assert STORAGE_DEFAULTS["discharge_efficiency_ratio"] == 0.90
+    assert STORAGE_DEFAULTS["mode_switch_penalty_cny"] == 10.0
     assert build_period_map(7)[80] == "sharp"  # 20:00
     assert build_period_map(2)[80] == "peak"
     assert build_period_map(1)[72] == "sharp"  # 18:00

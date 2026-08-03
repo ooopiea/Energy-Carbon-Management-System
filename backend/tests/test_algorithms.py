@@ -35,6 +35,66 @@ def test_storage_has_fair_terminal_soc_and_mutually_exclusive_modes() -> None:
     )
 
 
+def test_storage_daily_saving_excludes_monthly_demand_charge() -> None:
+    result = optimize_storage_dispatch(
+        load_kw=[100.0] * 8,
+        price_cny_per_kwh=[0.2] * 4 + [1.0] * 4,
+        battery_config={
+            "capacity_kwh": 100.0,
+            "max_charge_power_kw": 50.0,
+            "max_discharge_power_kw": 50.0,
+            "min_soc_ratio": 0.1,
+            "max_soc_ratio": 0.9,
+            "max_ramp_kw_per_step": 50.0,
+            "thermal_resistance_c_per_kw": 0.01,
+            "max_equivalent_full_cycles": 1.5,
+        },
+        initial_soc=0.5,
+    )
+
+    assert result["baseline_demand_cost_cny"] == 0
+    assert result["optimized_demand_cost_cny"] == 0
+    assert result["saving_cny"] == pytest.approx(
+        result["baseline_energy_cost_cny"]
+        - result["optimized_energy_cost_cny"]
+        - result["mode_switch_cost_cny"],
+        abs=0.02,
+    )
+    assert result["cost_scope"] == "daily_energy_plus_mode_switch_penalty"
+
+
+def test_storage_switch_penalty_discourages_charge_discharge_flipping() -> None:
+    common = {
+        "load_kw": [100.0] * 12,
+        "price_cny_per_kwh": [0.2, 1.0] * 6,
+        "initial_soc": 0.5,
+        "demand_price_cny_per_kw_month": 0.0,
+    }
+    config = {
+        "capacity_kwh": 100.0,
+        "max_charge_power_kw": 50.0,
+        "max_discharge_power_kw": 50.0,
+        "min_soc_ratio": 0.1,
+        "max_soc_ratio": 0.9,
+        "max_ramp_kw_per_step": 50.0,
+        "thermal_resistance_c_per_kw": 0.01,
+        "max_equivalent_full_cycles": 1.5,
+    }
+
+    unpenalized = optimize_storage_dispatch(
+        **common,
+        battery_config={**config, "mode_switch_penalty_cny": 0.0},
+    )
+    penalized = optimize_storage_dispatch(
+        **common,
+        battery_config={**config, "mode_switch_penalty_cny": 1_000.0},
+    )
+
+    assert unpenalized["mode_switch_count"] > 0
+    assert penalized["mode_switch_count"] < unpenalized["mode_switch_count"]
+    assert penalized["mode_switch_penalty_cny"] == 1_000.0
+
+
 def test_hvac_uses_real_registry_scale_without_fictional_ice_storage() -> None:
     n = 96
     result = optimize_hvac_dispatch(

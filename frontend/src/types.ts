@@ -206,6 +206,21 @@ export interface GraphTopology {
   edges: GraphEdge[]
 }
 
+export interface CheckpointView {
+  available: boolean
+  run_id?: string
+  schema_version?: number
+  subgraph?: string
+  workflow_status?: string
+  current_node?: string
+  last_completed_tick?: number | null
+  dispatch_enabled?: boolean
+  last_command_id?: string | null
+  last_ack_accepted?: boolean | null
+  updated_at?: string
+  approval_bindings?: Record<string, { status: string; report_id: string; report_hash: string }>
+}
+
 export interface RuntimeState {
   time: TimeInfo
   load_kw: number
@@ -243,6 +258,7 @@ export interface RuntimeState {
     wind: number
   }
   workflow: { run_id: string; status: string; current_node: string }
+  checkpoint: CheckpointView
   physical_dispatch: { enabled: boolean; last_execution: any; command_count: number }
   data_timeline: {
     start: string | null

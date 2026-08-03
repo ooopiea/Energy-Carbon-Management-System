@@ -142,7 +142,11 @@ async def test_revision_is_not_mislabeled_as_rejection(tmp_path) -> None:
     state = engine.get_state()
     assert gate.status == "pending_approval"
     assert gate.report is not None and gate.report.status == "pending"
-    assert state["workflow"]["status"] == "revision_requested"
+    # Forecast revision now re-runs prediction_agent and re-opens the gate
+    # (P2-2 fix), so the workflow is back to awaiting forecast approval
+    # rather than stuck in the dead "revision_requested" state.
+    assert "forecast" in state["workflow"]["status"]
+    assert state["workflow"]["status"] != "rejected"
 
 
 class ManualClock:
@@ -194,6 +198,18 @@ async def test_unsafe_manual_actions_fail_before_the_next_tick(tmp_path) -> None
                                            value=1_000_000_000, unit="kW", reason="test", actor="tester")
     await engine.run_step(0)
     previous = engine.get_state()["storage_power_kw"]
+    if abs(previous) < 1.0:
+        await engine.submit_control_action(
+            system="storage",
+            action="establish_nonzero_power",
+            target="power_kw",
+            value=15_000,
+            unit="kW",
+            reason="test",
+            actor="tester",
+        )
+        await engine.run_step(1)
+        previous = engine.get_state()["storage_power_kw"]
     opposite_limit = -15_000 if previous >= 0 else 15_000
     with pytest.raises(InvalidControlAction, match="爬坡"):
         await engine.submit_control_action(system="storage", action="unsafe", target="power_kw",

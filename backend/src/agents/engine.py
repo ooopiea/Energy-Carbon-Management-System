@@ -45,6 +45,11 @@ from data.simulator import generate_day_ahead_data
 from graph.workflow import build_energy_workflow
 from agents.reasoning import AgentReasoningService
 from llm.glm_client import GlmClient
+from repositories.state_repository import (
+    InMemoryStateRepository,
+    StateRepository,
+    RuntimeCheckpoint,
+)
 
 
 class ApprovalError(ValueError):
@@ -80,6 +85,8 @@ class SimulationEngine:
         time_engine: TimeEngine | None = None,
         executor: SimulationExecutor | None = None,
         glm_client: GlmClient | None = None,
+        state_repo: StateRepository | None = None,
+        resume_run_id: str | None = None,
     ):
         self._rng = random.Random(123)
         self._constraints = PhysicsConstraints()
@@ -91,6 +98,7 @@ class SimulationEngine:
         self._time = time_engine or get_time_engine(resolved_start)
         self._archive = ArchiveStore(archive_root)
         self._executor = executor or SimulationExecutor()
+        self._state_repo = state_repo or InMemoryStateRepository()
         self._reasoning = AgentReasoningService(glm_client)
         self._transition_lock = asyncio.Lock()
         self._broadcast_lock = asyncio.Lock()
@@ -118,6 +126,8 @@ class SimulationEngine:
             }
         )
         self._clear_all_state()
+        if resume_run_id is not None:
+            self._restore_from_checkpoint(resume_run_id)
 
     # ------------------------------------------------------------------
     # Lifecycle and graph transitions
@@ -152,10 +162,46 @@ class SimulationEngine:
         self._dispatch_enabled = False
         self._last_execution: DispatchExecution | None = None
         self._command_count = 0
+        self._acked_commands: dict[tuple[str, int], DispatchExecution] = {}
+        self._acked_steps: set[int] = set()
         self._current_values = self._empty_current_values()
         self._demand_cap_kw: float | None = None
         self._pending_overrides = {}
         self._init_nodes()
+
+    def _restore_from_checkpoint(self, run_id: str) -> bool:
+        """Restore workflow state from a saved checkpoint (G4 restart-resume).
+
+        Called during __init__ when resume_run_id is provided. Restores
+        workflow_status, current_node, dispatch_enabled, approval gate
+        statuses, and acked step numbers so that G3 idempotency holds
+        across process restarts.
+        """
+        cp = self._state_repo.load(run_id)
+        if cp is None:
+            return False
+        self._run_id = cp.run_id
+        self._last_day = cp.day
+        self._last_step = cp.step
+        self._workflow_state["run_id"] = cp.run_id
+        self._workflow_state["workflow_status"] = cp.workflow_status
+        self._workflow_state["current_node"] = cp.current_node
+        self._dispatch_enabled = cp.dispatch_enabled
+        # Restore approval gate statuses from checkpoint bindings.
+        for gate_id, binding in cp.approval_bindings.items():
+            gate = self._approval_gates.get(gate_id)
+            if gate is None:
+                continue
+            status_str = binding.get("status", "idle")
+            try:
+                gate.status = NodeStatus(status_str)
+            except ValueError:
+                gate.status = NodeStatus.IDLE
+            gate.report_id = binding.get("report_id") or None
+            gate.report_hash = binding.get("report_hash") or None
+        # Restore acked steps so G3 idempotency survives restart.
+        self._acked_steps = set(cp.acked_steps)
+        return True
 
     @staticmethod
     def _empty_current_values() -> dict[str, Any]:
@@ -203,6 +249,7 @@ class SimulationEngine:
             )
 
     def _prepare_day(self, day: int) -> None:
+        previous_storage_soc = float(self._current_values.get("storage_soc", 0.5))
         self._day_data = None
         self._storage_plan = None
         self._hvac_plan = None
@@ -216,7 +263,10 @@ class SimulationEngine:
         self._dispatch_enabled = False
         self._last_execution = None
         self._command_count = 0
+        self._acked_commands = {}
+        self._acked_steps = set()
         self._current_values = self._empty_current_values()
+        self._current_values["storage_soc"] = previous_storage_soc
         self._pending_overrides = {}
         self._run_id = f"run-{uuid.uuid4().hex[:12]}"
         self._workflow_state = {
@@ -251,6 +301,42 @@ class SimulationEngine:
             self._time.sim_time.date(),
             self._run_id,
         )
+        self._save_checkpoint()
+
+    def _save_checkpoint(self) -> None:
+        """Persist a RuntimeCheckpoint after each transition (G4)."""
+        bindings: dict[str, dict[str, str]] = {}
+        for gate_id, gate in self._approval_gates.items():
+            bindings[gate_id] = {
+                "status": gate.status.value if hasattr(gate.status, 'value') else str(gate.status),
+                "report_id": gate.report_id or "",
+                "report_hash": gate.report_hash or "",
+            }
+        cp = RuntimeCheckpoint(
+            run_id=self._run_id,
+            sim_time=self._time.sim_time.isoformat(),
+            day=self._last_day,
+            step=self._last_step,
+            workflow_status=self._workflow_state.get("workflow_status", "new"),
+            current_node=self._workflow_state.get("current_node", "idle"),
+            subgraph="realtime" if self._dispatch_enabled else "day_ahead",
+            approval_bindings=bindings,
+            last_completed_tick=self._last_step if self._dispatch_enabled else None,
+            last_command_id=(
+                self._last_execution.command.command_id
+                if self._last_execution else None
+            ),
+            last_ack_accepted=(
+                self._last_execution.ack.accepted
+                if self._last_execution else None
+            ),
+            dispatch_enabled=self._dispatch_enabled,
+            acked_steps=sorted(
+                step for (rid, step) in self._acked_commands if rid == self._run_id
+            ),
+            pending_recovery_reason="",
+        )
+        self._state_repo.save(self._run_id, cp)
 
     async def run_tick(self) -> None:
         if self._time.is_paused:
@@ -414,6 +500,7 @@ class SimulationEngine:
             self._day_data["price_cny_per_kwh"],
             carbon_factors=self._carbon_data["c_factors"],
             objective="min_cost",
+            initial_soc=float(self._current_values.get("storage_soc", 0.5)),
             solar_kw=self._day_data["solar_kw"],
             max_power_kw_series=self._day_data.get("storage_power_limit_kw"),
         )
@@ -443,7 +530,6 @@ class SimulationEngine:
         self._set_node("storage_dispatch", NodeStatus.COMPLETED, f"储能报告 {report.report_id} 待审批")
         return {
             "storage_result": {"report_id": report.report_id, "report_hash": report.content_hash},
-            "current_node": "storage_agent",
             "events": {"type": "storage_plan_created", "report_id": report.report_id},
         }
 
@@ -482,19 +568,28 @@ class SimulationEngine:
         self._set_node("hvac_dispatch", NodeStatus.COMPLETED, f"HVAC报告 {report.report_id} 待审批")
         return {
             "hvac_result": {"report_id": report.report_id, "report_hash": report.content_hash},
-            "current_node": "hvac_agent",
             "events": {"type": "hvac_plan_created", "report_id": report.report_id},
         }
 
     async def _graph_dispatch_approvals(self, state: EnergySystemState) -> dict[str, Any]:
-        storage_report = self._find_report(state["storage_result"]["report_id"])
-        hvac_report = self._find_report(state["hvac_result"]["report_id"])
-        storage_gate = self._bind_gate(
-            "storage_approval", storage_report, f"预计节省 {self._storage_plan['saving_cny']:.0f} 元"
-        )
-        hvac_gate = self._bind_gate(
-            "hvac_approval", hvac_report, f"预计节省 {self._hvac_plan['saving_cny']:.0f} 元"
-        )
+        # Only rebind gates whose report has changed; keep already-approved gates
+        # whose report binding is still valid (G2 local revision).
+        new_storage_id = state["storage_result"]["report_id"]
+        new_hvac_id = state["hvac_result"]["report_id"]
+        storage_gate = self._approval_gates["storage_approval"]
+        if storage_gate.report_id != new_storage_id:
+            storage_report = self._find_report(new_storage_id)
+            storage_gate = self._bind_gate(
+                "storage_approval", storage_report,
+                f"预计节省 {self._storage_plan['saving_cny']:.0f} 元",
+            )
+        hvac_gate = self._approval_gates["hvac_approval"]
+        if hvac_gate.report_id != new_hvac_id:
+            hvac_report = self._find_report(new_hvac_id)
+            hvac_gate = self._bind_gate(
+                "hvac_approval", hvac_report,
+                f"预计节省 {self._hvac_plan['saving_cny']:.0f} 元",
+            )
         return {
             "storage_approval": storage_gate.model_dump(mode="json"),
             "hvac_approval": hvac_gate.model_dump(mode="json"),
@@ -616,8 +711,26 @@ class SimulationEngine:
 
         if decision == "revise":
             self._dispatch_enabled = False
+            # Branch-level revision: only re-run the affected agent, keep the
+            # other branch's valid approval intact (G2 local revision).
+            if gate_id == "storage_approval":
+                self._workflow_state["workflow_status"] = "storage_revision"
+                self._workflow_state["current_node"] = gate_id
+                await self._invoke_graph_locked()
+                return self._approval_gates["storage_approval"]
+            if gate_id == "hvac_approval":
+                self._workflow_state["workflow_status"] = "hvac_revision"
+                self._workflow_state["current_node"] = gate_id
+                await self._invoke_graph_locked()
+                return self._approval_gates["hvac_approval"]
+            if gate_id == "forecast_approval":
+                self._workflow_state["workflow_status"] = "forecast_revision"
+                self._workflow_state["current_node"] = gate_id
+                await self._invoke_graph_locked()
+                return self._approval_gates["forecast_approval"]
             self._workflow_state["workflow_status"] = "revision_requested"
             self._workflow_state["current_node"] = gate_id
+            self._save_checkpoint()
             return gate
 
         if decision == "reject":
@@ -627,6 +740,7 @@ class SimulationEngine:
             if gate_id == "forecast_approval":
                 self._storage_plan = None
                 self._hvac_plan = None
+            self._save_checkpoint()
             return gate
 
         if gate_id == "forecast_approval":
@@ -716,6 +830,7 @@ class SimulationEngine:
                     self._run_id,
                     event_type="control_action_executed",
                 )
+            self._save_checkpoint()
             return record
 
     def _validate_physical_action(self, system: str, target: str, value: float) -> None:
@@ -754,6 +869,14 @@ class SimulationEngine:
 
     async def _update_realtime_locked(self, step: int) -> None:
         if self._day_data is None:
+            return
+        # G3 idempotency: skip re-execution if this step was already ACKed.
+        acked = self._acked_commands.get((self._run_id, step))
+        if acked is not None:
+            self._last_execution = acked
+            return
+        # Cross-restart idempotency: step was ACKed before restart.
+        if step in self._acked_steps:
             return
         dd = self._day_data
         ts = dd["timestamps"][step]
@@ -829,6 +952,8 @@ class SimulationEngine:
             else:
                 self._last_execution = execution
                 self._command_count += 1
+                self._acked_commands[(self._run_id, step)] = execution
+                self._acked_steps.add(step)
                 storage_power = execution.feedback.measured_storage_power_kw
                 hvac_power = execution.feedback.measured_hvac_power_kw
                 soc = execution.feedback.measured_storage_soc
@@ -915,6 +1040,7 @@ class SimulationEngine:
         )
         await self._monitor_check(step, soc, storage_temp, hvac_supply, load)
         await self._broadcast()
+        self._save_checkpoint()
 
     async def _monitor_check(self, step: int, soc: float, temp: float, hvac_supply: float, load: float) -> None:
         self._set_node("monitor", NodeStatus.RUNNING)
@@ -1219,7 +1345,7 @@ class SimulationEngine:
         selected = requested or allowed
         state = self.get_state()
         pending = [key for key, gate in state["approval_gates"].items()
-                   if gate["status"] == NodeStatus.PENDING_APPROVAL]
+                    if gate["status"] == NodeStatus.PENDING_APPROVAL]
         source = state.get("data_provenance", {}).get("load", {})
         findings = {
             "data_agent": (
@@ -1380,6 +1506,7 @@ class SimulationEngine:
                 "status": self._workflow_state.get("workflow_status", "idle"),
                 "current_node": self._workflow_state.get("current_node", "idle"),
             },
+            "checkpoint": self._get_checkpoint_view(),
             "physical_dispatch": {
                 "enabled": self._dispatch_enabled,
                 "last_execution": self._last_execution.model_dump(mode="json") if self._last_execution else None,
@@ -1390,6 +1517,28 @@ class SimulationEngine:
                 "demand_cap_kw": self._demand_cap_kw,
                 "enabled": self._demand_cap_kw is not None,
             },
+        }
+
+    def _get_checkpoint_view(self) -> dict[str, Any]:
+        """Expose checkpoint/recovery state for the frontend (G4/§12.5)."""
+        cp = self._state_repo.load(self._run_id)
+        if cp is None:
+            return {"available": False, "subgraph": "day_ahead", "last_tick": None}
+        return {
+            "available": True,
+            "run_id": cp.run_id,
+            "schema_version": cp.schema_version,
+            "subgraph": cp.subgraph,
+            "workflow_status": cp.workflow_status,
+            "current_node": cp.current_node,
+            "day": cp.day,
+            "step": cp.step,
+            "last_completed_tick": cp.last_completed_tick,
+            "dispatch_enabled": cp.dispatch_enabled,
+            "last_command_id": cp.last_command_id,
+            "last_ack_accepted": cp.last_ack_accepted,
+            "updated_at": cp.updated_at.isoformat(),
+            "approval_bindings": cp.approval_bindings,
         }
 
     def _current_weather(self) -> dict[str, float]:
