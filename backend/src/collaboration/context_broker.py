@@ -13,17 +13,17 @@ from collaboration.contracts import (
 FACT_WHITELIST: dict[str, set[str]] = {
     AgentRole.DATA: {
         "data_provenance", "data_timeline", "load_kw", "solar_kw",
-        "weather",
+        "weather", "day_ahead",
     },
     AgentRole.STORAGE: {
         "storage_soc", "storage_power_kw", "storage_temp_c",
         "storage_summary", "load_kw", "solar_kw",
-        "day_ahead", "carbon_dispatch",
+        "day_ahead", "carbon_dispatch", "price", "tariff_period",
     },
     AgentRole.HVAC: {
         "hvac_power_kw", "hvac_supply_temp_c", "hvac_return_temp_c",
         "hvac_summary", "weather", "day_ahead",
-        "chiller_topology",
+        "chiller_topology", "price", "tariff_period",
     },
     AgentRole.RISK: {
         "storage_soc", "storage_temp_c", "storage_power_kw",

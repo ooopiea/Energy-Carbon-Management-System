@@ -28,6 +28,7 @@ from data.raw_loader import (
     load_load_profile,
     load_tariff_prices,
 )
+from data.raw_loader import load_cr_factors
 
 
 # 实际四季负荷基线（kW，96点），来自黄花园区用电负荷参考
@@ -154,6 +155,16 @@ class DataSimulator:
                 "quality": "simulated",
             }
 
+        # --- 电碳责任因子（全年 Cr 台账，不走电碳计算）---
+        cr_series, cr_source = load_cr_factors(sim_date.date())
+        if cr_series is None:
+            cr_series = [0.5366] * POINTS_PER_DAY
+            cr_source = {
+                "source": "purchase_factor_fallback",
+                "loaded": True,
+                "quality": "proxy",
+            }
+
         # --- 电价 ---
         from core.config import build_price_series, build_period_map
         tariff_rates, tariff_source = load_tariff_prices(month)
@@ -206,6 +217,7 @@ class DataSimulator:
             "weather": weather,
             "solar_kw": solar,
             "generation_mix": gen_mix,
+            "cr_factors": cr_series,
             "price_cny_per_kwh": price,
             "tariff_periods": periods,
             "schedule": schedule,
@@ -227,6 +239,7 @@ class DataSimulator:
                     "capacity_kw": SITE_SOLAR_CAPACITY_KW,
                 },
                 "generation_mix": generation_source,
+                "cr": cr_source,
                 "tariff": tariff_source,
                 "assets": asset_source,
             },

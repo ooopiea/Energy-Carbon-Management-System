@@ -35,6 +35,8 @@ def optimize_storage_dispatch(
     billing_peak_floor_kw: float = 0.0,
     demand_price_cny_per_kw_month: float = 0.0,
     max_power_kw_series: list[float] | None = None,
+    ambient_temp_c_series: list[float] | None = None,
+    carbon_price_cny_per_ton: float = 80.0,
 ) -> dict[str, Any]:
     """优化储能充放电调度。
 
@@ -84,6 +86,9 @@ def optimize_storage_dispatch(
     eta_dis = cfg["discharge_efficiency_ratio"]
     switch_penalty = max(0.0, float(cfg.get("mode_switch_penalty_cny", 0.0) or 0.0))
     t_amb = cfg["ambient_temperature_c"]
+    t_amb_series = ambient_temp_c_series or [t_amb] * n
+    if len(t_amb_series) != n:
+        raise ValueError("ambient_temp_c_series length must match load_kw")
     r_th = cfg["thermal_resistance_c_per_kw"]
     tau_th = cfg["thermal_time_constant_min"]
 
@@ -125,8 +130,8 @@ def optimize_storage_dispatch(
         prob += base_grid[t] - p_dis[t] + p_ch[t] <= peak
 
     for t in range(n):
-        prev_t = t_amb if t == 0 else temp[t - 1]
-        prob += temp[t] == t_amb + (prev_t - t_amb) * alpha + (p_ch[t] + p_dis[t]) * r_th * (1 - alpha)
+        prev_t = t_amb_series[t] if t == 0 else temp[t - 1]
+        prob += temp[t] == t_amb_series[t] + (prev_t - t_amb_series[t]) * alpha + (p_ch[t] + p_dis[t]) * r_th * (1 - alpha)
 
     prob += soc[n - 1] == target_soc
 
@@ -139,16 +144,18 @@ def optimize_storage_dispatch(
         for t in range(n)
     )
     demand_objective = peak * max(0.0, demand_price_cny_per_kw_month)
+    carbon_objective = pulp.lpSum((-p_dis[t] + p_ch[t]) * cf[t] * dt_h for t in range(n))
+    carbon_price_cny_per_kg = max(0.0, carbon_price_cny_per_ton) / 1000.0
     switch_objective = switch_penalty * pulp.lpSum(mode_switch)
 
     if objective == "min_cost":
         prob += energy_objective + demand_objective + switch_objective
     elif objective == "min_carbon":
-        prob += pulp.lpSum((-p_dis[t] + p_ch[t]) * cf[t] * dt_h for t in range(n))
-    elif objective == "limit_peak":
-        prob += peak
+        prob += carbon_objective
     elif objective == "combined":
         prob += energy_objective + demand_objective + switch_objective
+    elif objective == "weighted":
+        prob += energy_objective + carbon_price_cny_per_kg * carbon_objective + switch_objective
     else:
         raise ValueError(f"unsupported objective: {objective}")
 
@@ -179,13 +186,15 @@ def optimize_storage_dispatch(
     s, th = initial_soc, t_amb
     for t in range(n):
         s = s + charge_coef * p_ch_v[t] - discharge_coef * p_dis_v[t]
-        th = t_amb + (th - t_amb) * alpha + (p_ch_v[t] + p_dis_v[t]) * r_th * (1 - alpha)
+        th = t_amb_series[t] + (th - t_amb_series[t]) * alpha + (p_ch_v[t] + p_dis_v[t]) * r_th * (1 - alpha)
         soc_v.append(s)
         temp_v.append(th)
 
     grid = [base_grid[t] - power[t] for t in range(n)]
     baseline_energy_cost = sum(base_grid[t] * price_cny_per_kwh[t] * dt_h for t in range(n))
     optimized_energy_cost = sum(grid[t] * price_cny_per_kwh[t] * dt_h for t in range(n))
+    baseline_carbon_kg = sum(base_grid[t] * cf[t] * dt_h for t in range(n))
+    optimized_carbon_kg = sum(grid[t] * cf[t] * dt_h for t in range(n))
     baseline_peak = max(max(base_grid), billing_peak_floor_kw)
     optimized_peak = max(max(grid), billing_peak_floor_kw)
     baseline_demand_cost = baseline_peak * max(0.0, demand_price_cny_per_kw_month)
@@ -228,6 +237,10 @@ def optimize_storage_dispatch(
         "mode_switch_count": mode_switch_count,
         "mode_switch_penalty_cny": switch_penalty,
         "mode_switch_cost_cny": round(mode_switch_cost, 2),
+        "baseline_carbon_kg": round(baseline_carbon_kg, 1),
+        "optimized_carbon_kg": round(optimized_carbon_kg, 1),
+        "carbon_reduction_kg": round(baseline_carbon_kg - optimized_carbon_kg, 1),
+        "carbon_price_cny_per_ton": carbon_price_cny_per_ton,
         "cost_scope": (
             "daily_energy_plus_mode_switch_penalty"
             if demand_price_cny_per_kw_month <= 0

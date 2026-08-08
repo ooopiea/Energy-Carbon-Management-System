@@ -59,8 +59,11 @@ interface AppStore {
   fetchControlActions: () => Promise<void>
   fetchChatHistory: () => Promise<void>
   fetchLlmStatus: () => Promise<void>
-  sendChatMessage: (message: string) => Promise<void>
-  decideDisturbance: (eventId: string, decision: 'apply' | 'cancel') => Promise<void>
+ sendChatMessage: (message: string) => Promise<void>
+ decideDisturbance: (eventId: string, decision: 'apply' | 'cancel') => Promise<void>
+  confirmFacilityAction: (proposalId: string) => Promise<void>
+  cancelFacilityAction: (proposalId: string) => Promise<void>
+  resumeMission: (missionId: string, humanInput: string) => Promise<void>
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -112,7 +115,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
     return { actionRecords, operationMessage: { kind: result === 'success' ? 'success' : 'error', text: `${action}：${result === 'success' ? '已完成' : '失败'}${detail ? ` · ${detail}` : ''}` } }
   }),
   clearOperationMessage: () => set({ operationMessage: null }),
-  setChatRole: (role) => set({ chatRole: role }),
+  setChatRole: (role) => {
+    set({ chatRole: role })
+    get().fetchChatHistory()
+  },
 
   fetchState: async () => {
     if (get().loadState === 'idle') set({ loadState: 'loading', errorMessage: null })
@@ -222,7 +228,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   fetchChatHistory: async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/chat/history?session_id=huanghua-main`)
+      const role = get().chatRole
+      const res = await fetch(`${API_BASE}/api/chat/history?session_id=huanghua-main&actor_role=${role}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const body = await res.json()
       set({ chatMessages: body.messages ?? [], llmStatus: body.llm ?? null })
@@ -286,6 +293,49 @@ export const useAppStore = create<AppStore>((set, get) => ({
       get().recordAction(decision === 'apply' ? '确认扰动并重算' : '取消扰动', eventId, 'failed', detail)
       throw e
     }
+  },
+  confirmFacilityAction: async (proposalId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/facility-actions/${proposalId}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actor: get().chatRole }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
+      if (body.state) set({ state: body.state })
+      get().recordAction('confirm facility action', proposalId, 'success')
+    } catch (e) {
+      get().recordAction('confirm facility action', proposalId, 'failed', e instanceof Error ? e.message : 'failed')
+      throw e
+    }
+  },
+  cancelFacilityAction: async (proposalId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/facility-actions/${proposalId}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actor: get().chatRole }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
+      if (body.state) set({ state: body.state })
+      get().recordAction('cancel facility action', proposalId, 'success')
+    } catch (e) {
+      get().recordAction('cancel facility action', proposalId, 'failed', e instanceof Error ? e.message : 'failed')
+      throw e
+    }
+  },
+  resumeMission: async (missionId, humanInput) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/mission/${missionId}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ human_input: humanInput }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await get().fetchState()
+    } catch (e) { console.error('resumeMission error', e) }
   },
 }))
 

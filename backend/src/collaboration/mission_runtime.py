@@ -46,7 +46,7 @@ class Aggregator(Protocol):
 
 
 class ProposalBridge(Protocol):
-    def bridge(self, proposal: JointProposal, snapshot: OperationalSnapshot) -> str: ...
+    async def bridge(self, proposal: JointProposal, snapshot: OperationalSnapshot) -> str: ...
 
 
 class MissionRuntime:
@@ -176,7 +176,7 @@ class MissionRuntime:
             return self._to_result(state)
 
         if self._bridge and state.joint_proposal:
-            msg = self._bridge.bridge(state.joint_proposal, fresh)
+            msg = await self._bridge.bridge(state.joint_proposal, fresh)
             state.tool_trace.append({"name": "proposal_bridge", "result": msg})
 
         state.status = MissionStatus.COMPLETED
@@ -193,6 +193,8 @@ class MissionRuntime:
             return AgentRole.HVAC
         if "risk" in obj or "风险" in task.objective:
             return AgentRole.RISK
+        if "monitor" in obj or "监视" in task.objective or "监控" in task.objective:
+            return AgentRole.MONITOR
         return ""
 
     def _review_risks(self, results: list[AgentResult]) -> RiskAssessment:

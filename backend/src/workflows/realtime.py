@@ -58,6 +58,10 @@ class RealtimeTickEngine:
         load = dd["load_kw"][step] * (1 + self._rng.gauss(0, 0.01))
         solar = dd["solar_kw"][step]
         previous_storage_power = float(inp.previous_values.get("storage_power_kw", 0.0))
+        # Ramp check should compare against the previous commanded setpoint,
+        # not the noisy measured value which can exceed rated power by ±1%.
+        previous_storage_setpoint = float(inp.previous_values.get(
+            "storage_power_setpoint_kw", previous_storage_power))
         soc = float(inp.previous_values.get("storage_soc", 0.5))
         storage_temp = float(inp.previous_values.get(
             "storage_temp_c", STORAGE_DEFAULTS["ambient_temperature_c"]
@@ -70,6 +74,7 @@ class RealtimeTickEngine:
 
         result = TickResult(step=step)
 
+        storage_sp = 0.0
         # --- Steps 2-7: Only if dispatch is active (plans approved) ---
         dispatch_active = (
             inp.storage_plan is not None
@@ -94,7 +99,7 @@ class RealtimeTickEngine:
                     hvac_power_kw=hvac_sp,
                     hvac_supply_temp_c=hvac_supply_sp,
                     hvac_return_temp_c=hvac_return_sp,
-                    previous_storage_power_kw=previous_storage_power,
+                    previous_storage_power_kw=previous_storage_setpoint,
                     previous_storage_soc=soc,
                     previous_storage_temp_c=storage_temp,
                     ambient_temp_c=float(dd["weather"]["temp_c"][step]),
@@ -157,6 +162,7 @@ class RealtimeTickEngine:
             "solar_kw": round(solar, 1),
             "grid_kw": round(grid, 1),
             "storage_power_kw": round(storage_power_out, 1),
+            "storage_power_setpoint_kw": round(storage_sp, 3),
             "storage_soc": round(soc, 4),
             "storage_temp_c": round(storage_temp, 2),
             "hvac_power_kw": round(hvac_power, 1),
@@ -193,9 +199,9 @@ class RealtimeTickEngine:
             target = override.target.lower()
             if override.system == "storage":
                 storage_sp = override.value
-            elif "power" in target:
+            elif "power" in target or "功率" in target:
                 hvac_sp = override.value
-            elif "supply" in target:
+            elif "supply" in target or "供水" in target:
                 hvac_supply_sp = override.value
 
         return storage_sp, hvac_sp, hvac_supply_sp, hvac_return_sp

@@ -15,6 +15,7 @@ _EPS = 1e-9
 def compute_carbon_factors(
     generation_mix: list[dict[str, float]],
     response_lambda: float = 0.5,
+    external_cr_factors: list[float] | None = None,
 ) -> dict:
     """计算 C(τ) 和 Cr(τ) 碳因子序列。
 
@@ -62,29 +63,35 @@ def compute_carbon_factors(
         if c_factors and weight_sum > _EPS
         else 0.0
     )
-    denom = max(c_bar, _EPS)
+    if external_cr_factors is not None and len(external_cr_factors) == len(c_factors):
+        cr_factors = [float(v) for v in external_cr_factors]
+        ratios = [
+            cr / c if c > _EPS else 1.0
+            for cr, c in zip(cr_factors, c_factors, strict=True)
+        ]
+    else:
+        denom = max(c_bar, _EPS)
 
-    cr_factors = []
-    ratios = []
-    for c in c_factors:
-        adjust = 1.0 + response_lambda * (c - c_bar) / denom
-        cr_factors.append(c * adjust)
-        ratios.append(adjust)
+        cr_factors = []
+        ratios = []
+        for c in c_factors:
+            adjust = 1.0 + response_lambda * (c - c_bar) / denom
+            cr_factors.append(c * adjust)
+            ratios.append(adjust)
 
-    # 守恒归一化：mean(Cr) = mean(C) = C̄
-    if cr_factors:
-        cr_mean = sum(
-            cr * weight
-            for cr, weight in zip(cr_factors, conservation_weights, strict=True)
-        ) / max(weight_sum, _EPS)
-        if cr_mean > _EPS:
-            scale = c_bar / cr_mean
-            cr_factors = [cr * scale for cr in cr_factors]
-            ratios = [
-                cr / c if c > _EPS else 1.0
-                for cr, c in zip(cr_factors, c_factors, strict=True)
-            ]
-
+        # 守恒归一化：mean(Cr) = mean(C) = C̄
+        if cr_factors:
+            cr_mean = sum(
+                cr * weight
+                for cr, weight in zip(cr_factors, conservation_weights, strict=True)
+            ) / max(weight_sum, _EPS)
+            if cr_mean > _EPS:
+                scale = c_bar / cr_mean
+                cr_factors = [cr * scale for cr in cr_factors]
+                ratios = [
+                    cr / c if c > _EPS else 1.0
+                    for cr, c in zip(cr_factors, c_factors, strict=True)
+                ]
     return {
         "c_factors": c_factors,
         "cr_factors": cr_factors,

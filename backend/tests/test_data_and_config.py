@@ -34,8 +34,10 @@ def test_simulator_is_15_minute_and_reports_provenance() -> None:
     assert day["asset_registry"]["summary"]["compressor_units"] == 38
     assert day["compressor_capability"]["dispatch_mode"] == "monitor_only"
     assert set(day["data_provenance"]) == {
-        "load", "weather", "site_solar", "generation_mix", "tariff", "assets"
+        "load", "weather", "site_solar", "generation_mix", "tariff", "assets", "cr"
     }
+    assert len(day["cr_factors"]) == 96
+    assert all(isinstance(v, float) for v in day["cr_factors"])
 
 
 def test_cross_month_global_day_index_does_not_double_count_days() -> None:

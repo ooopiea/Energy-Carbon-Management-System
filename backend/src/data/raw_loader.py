@@ -353,6 +353,78 @@ def load_generation_mix(
         return None, _provenance("raw_hunan_generation", folder, reason=f"{type(exc).__name__}: {exc}")
 
 
+@lru_cache(maxsize=1)
+def _load_cr_lookup(
+    raw_dir: Path = DATA_RAW_DIR,
+) -> tuple[dict[str, list[float]] | None, dict[str, Any]]:
+    """读取全年 Cr 台账(Cr_example.xlsx),一次性加载为 MM-DD -> 96 点查表。"""
+    path = raw_dir / "Cr_example.xlsx"
+    if not path.exists():
+        return None, _provenance("raw_cr_ledger", path, reason="file_missing")
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        lookup: dict[str, list[float]] = {}
+        try:
+            for sheet in workbook.worksheets:
+                header = None
+                for row in sheet.iter_rows(min_row=1, max_row=1, values_only=True):
+                    header = tuple(str(v).strip() if v is not None else "" for v in row[:3])
+                if header != ("\u65e5\u671f", "\u65f6\u95f4", "Cr"):
+                    continue
+                current_key: str | None = None
+                for row in sheet.iter_rows(min_row=2, values_only=True):
+                    date_cell = str(row[0]).strip() if row[0] is not None else ""
+                    cr_value = row[2]
+                    if date_cell:
+                        current_key = date_cell
+                    if cr_value is not None and current_key is not None:
+                        lookup.setdefault(current_key, []).append(float(cr_value))
+        finally:
+            workbook.close()
+        if not lookup:
+            return None, _provenance("raw_cr_ledger", path, reason="no_valid_rows")
+        first_len = len(next(iter(lookup.values())))
+        return lookup, _provenance(
+            "raw_cr_ledger",
+            path,
+            loaded=True,
+            days=len(lookup),
+            points_per_day=first_len,
+            date_format="MM-DD",
+            unit="kgCO2/kWh",
+        )
+    except Exception as exc:
+        return None, _provenance("raw_cr_ledger", path, reason=f"{type(exc).__name__}: {exc}")
+
+
+def load_cr_factors(
+    target_date: date,
+    raw_dir: Path = DATA_RAW_DIR,
+) -> tuple[list[float] | None, dict[str, Any]]:
+    """按日期返回 96 点动态碳排放责任因子 Cr(tau)。"""
+    lookup, provenance = _load_cr_lookup(raw_dir)
+    if lookup is None:
+        return None, provenance
+    key = target_date.strftime("%m-%d")
+    series = lookup.get(key)
+    if series is not None:
+        return list(series), {**provenance, "selected_date": key, "exact_match": True}
+    # 台账为 365 天平年,2-29 时取最近日期兜底
+    best = min(
+        lookup.keys(),
+        key=lambda k: abs(
+            int(k[:2]) * 100 + int(k[3:]) - target_date.month * 100 - target_date.day
+        ),
+    )
+    return list(lookup[best]), {
+        **provenance,
+        "selected_date": best,
+        "exact_match": best == key,
+    }
+
+
 def load_asset_registry(raw_dir: Path = DATA_RAW_DIR) -> tuple[dict[str, Any], dict[str, Any]]:
     """读取冷机与空压机台账并计算可审计汇总。"""
     folder = raw_dir / "HVAC_AC"

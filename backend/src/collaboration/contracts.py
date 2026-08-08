@@ -118,6 +118,7 @@ class JointProposal(BaseModel):
     conflicts: list[str] = Field(default_factory=list)
     required_approvals: list[str] = Field(default_factory=list)
     summary: str = ""
+    action_payloads: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SafetyVerdict(BaseModel):

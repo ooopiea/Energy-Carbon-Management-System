@@ -247,7 +247,11 @@ async def test_combined_accounting_and_overview_strategy_are_effective(tmp_path)
 
     await engine.submit_control_action(system="overview", action="cap", target="demand_cap_kw",
                                        value=30_000, unit="kW", reason="test", actor="tester")
-    assert engine.get_state()["active_strategy"] == {"demand_cap_kw": 30_000, "enabled": True}
+    strategy = engine.get_state()["active_strategy"]
+    assert strategy["demand_cap_kw"] == 30_000
+    assert strategy["enabled"] is True
+    # objective_mode was added to active_strategy; verify it exists
+    assert "objective_mode" in engine.get_state()["active_strategy"]
     await engine.run_step(0)
     command = engine.get_state()["physical_dispatch"]["last_execution"]["command"]
     assert command["storage_power_kw"] >= state["day_ahead"]["storage_plan"][0]

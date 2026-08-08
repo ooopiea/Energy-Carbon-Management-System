@@ -30,6 +30,7 @@ from agents.engine import (
     get_engine,
 )
 from agents.chat_service import FacilityChatService
+from collaboration.engine_adapter import build_mission_runtime
 from graph.workflow import get_graph_topology
 
 
@@ -63,6 +64,21 @@ class DisturbanceDecisionRequest(BaseModel):
     actor: str = Field(default="值班工程师", min_length=1, max_length=128)
 
 
+class MissionStartRequest(BaseModel):
+    goal: str = Field(min_length=1, max_length=2000)
+    actor: str = Field(default="engineer", min_length=1, max_length=128)
+    actor_role: Literal["engineer", "facility"] = "engineer"
+    session_id: str = Field(default="huanghua-main", min_length=1, max_length=128)
+
+
+class MissionResumeRequest(BaseModel):
+    human_input: str = Field(min_length=1, max_length=4000)
+
+
+class FacilityActionDecisionRequest(BaseModel):
+    actor: str = Field(default="facility", min_length=1, max_length=128)
+
+
 def _allowed_origins() -> list[str]:
     configured = os.getenv("ENERGY_CORS_ORIGINS", "")
     if configured.strip():
@@ -72,7 +88,8 @@ def _allowed_origins() -> list[str]:
 
 def create_app(engine: SimulationEngine | None = None, start_background: bool = True) -> FastAPI:
     runtime_engine = engine or get_engine()
-    chat_service = FacilityChatService(runtime_engine)
+    mission_runtime = build_mission_runtime(runtime_engine)
+    chat_service = FacilityChatService(runtime_engine, mission_runtime=mission_runtime)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -221,10 +238,13 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
         return result
 
     @application.get("/api/chat/history")
-    async def chat_history(session_id: str = Query(default="huanghua-main", max_length=128)):
+    async def chat_history(
+        session_id: str = Query(default="huanghua-main", max_length=128),
+        actor_role: str | None = Query(default=None),
+    ):
         return {
             "session_id": session_id,
-            "messages": chat_service.history(session_id),
+            "messages": chat_service.history(session_id, actor_role),
             "llm": chat_service.status(),
         }
 
@@ -253,6 +273,49 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
             "event": event.model_dump(mode="json"),
             "state": runtime_engine.get_state(),
         }
+
+    @application.post("/api/mission")
+    async def start_mission(payload: MissionStartRequest):
+        result = await mission_runtime.start(
+            payload.goal, payload.actor, payload.actor_role, payload.session_id
+        )
+        return result.model_dump(mode="json")
+
+    @application.post("/api/mission/{mission_id}/resume")
+    async def resume_mission(mission_id: str, payload: MissionResumeRequest):
+        try:
+            result = await mission_runtime.resume(mission_id, payload.human_input)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
+
+    @application.get("/api/mission/{mission_id}")
+    async def get_mission(mission_id: str):
+        return mission_runtime.get(mission_id).model_dump(mode="json")
+
+    @application.post("/api/facility-actions/{proposal_id}/confirm")
+    async def confirm_facility_action(proposal_id: str, payload: FacilityActionDecisionRequest):
+        try:
+            action = await runtime_engine.confirm_facility_action(proposal_id, payload.actor)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await runtime_engine.broadcast_state()
+        return {"action": action.model_dump(mode="json"), "state": runtime_engine.get_state()}
+
+    @application.post("/api/facility-actions/{proposal_id}/cancel")
+    async def cancel_facility_action(proposal_id: str, payload: FacilityActionDecisionRequest):
+        try:
+            action = await runtime_engine.cancel_facility_action(proposal_id, payload.actor)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await runtime_engine.broadcast_state()
+        return {"action": action.model_dump(mode="json"), "state": runtime_engine.get_state()}
 
     @application.post("/api/alerts/{alert_id}/acknowledge")
     async def acknowledge_alert(alert_id: str):

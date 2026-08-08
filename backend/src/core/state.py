@@ -198,6 +198,29 @@ class DisturbanceEvent(BaseModel):
     impact_summary: str = ""
 
 
+class FacilityAction(BaseModel):
+    """Structured facility-side action proposal with preview and post-monitoring."""
+
+    proposal_id: str
+    action_type: Literal[
+        "day_ahead_modification",
+        "realtime_override",
+        "demand_cap",
+        "mission",
+    ]
+    target_system: Literal["overview", "storage", "hvac"]
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    impact_preview: dict[str, Any] = Field(default_factory=dict)
+    reasoning: str = ""
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    status: Literal["proposed", "confirmed", "applied", "cancelled", "failed"] = "proposed"
+    created_at: datetime
+    decided_at: datetime | None = None
+    decided_by: str | None = None
+    post_execution: dict[str, Any] | None = None
+    monitor_steps_remaining: int = 0
+
+
 class TimeSeriesPoint(BaseModel):
     """单个时间序列数据点。"""
     timestamp: datetime

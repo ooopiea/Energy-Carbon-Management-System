@@ -116,6 +116,22 @@ export interface DisturbanceEvent {
   impact_summary: string
 }
 
+export interface FacilityAction {
+  proposal_id: string
+  action_type: 'day_ahead_modification' | 'realtime_override' | 'demand_cap' | 'mission'
+  target_system: 'overview' | 'storage' | 'hvac'
+  parameters: Record<string, unknown>
+  impact_preview: Record<string, unknown>
+  reasoning: string
+  confidence: number
+  status: 'proposed' | 'confirmed' | 'applied' | 'cancelled' | 'failed'
+  created_at: string
+  decided_at: string | null
+  decided_by: string | null
+  post_execution: Record<string, unknown> | null
+  monitor_steps_remaining: number
+}
+
 export interface ChatMessage {
   message_id: string
   role: 'user' | 'assistant'
@@ -124,6 +140,7 @@ export interface ChatMessage {
   content: string
   created_at: string
   event_ids: string[]
+  facility_action_ids: string[]
   tool_trace: Array<{ name: string; result: unknown }>
   mode: 'user' | 'glm' | 'rule_fallback'
 }
@@ -159,6 +176,11 @@ export interface StorageSummary {
   temp_c: number[]
   grid_kw: number[]
   saving_cny: number
+  baseline_carbon_kg?: number
+  optimized_carbon_kg?: number
+  carbon_reduction_kg?: number
+  baseline_energy_cost_cny?: number
+  optimized_energy_cost_cny?: number
   peak_reduction_kw: number
   terminal_soc: number
   max_temp_c: number
@@ -267,6 +289,8 @@ export interface RuntimeState {
     resolution_minutes: number
     provenance: Record<string, unknown>
   }
-  disturbances: DisturbanceEvent[]
-  active_strategy: { demand_cap_kw: number | null; enabled: boolean }
+ disturbances: DisturbanceEvent[]
+  current_phase: string
+  facility_actions: FacilityAction[]
+ active_strategy: { demand_cap_kw: number | null; enabled: boolean; objective_mode?: string }
 }

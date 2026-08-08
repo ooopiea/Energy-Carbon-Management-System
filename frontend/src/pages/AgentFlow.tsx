@@ -121,9 +121,9 @@ export function AgentFlow() {
           )
         })}
 
-        {/* 节点 */}
-        {graph.nodes.map((node: GraphNode) => {
-          const status = getNodeStatus(node.id, agentNodes, state.approval_gates)
+       {/* 节点 */}
+        {graph.nodes.filter((n: GraphNode) => n.type !== 'route').map((node: GraphNode) => {
+         const status = getNodeStatus(node.id, agentNodes, state.approval_gates)
           const color = statusColor(status)
           const isSelected = selectedNodeId === node.id
           const w = 120
