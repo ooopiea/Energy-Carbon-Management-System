@@ -1,0 +1,19 @@
+services:
+  energy-management:
+    build:
+      context: .
+    ports:
+      - "8000:8000"
+    environment:
+      ENERGY_CORS_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000"
+      ENERGY_AUTO_APPROVE: "false"
+      ZAI_API_KEY: "${ZAI_API_KEY:-}"
+      GLM_BASE_URL: "${GLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4/}"
+      GLM_MODEL: "${GLM_MODEL:-glm-5.2}"
+      GLM_THINKING: "${GLM_THINKING:-enabled}"
+    volumes:
+      - energy-archive:/app/backend/data/archive
+    restart: unless-stopped
+
+volumes:
+  energy-archive:

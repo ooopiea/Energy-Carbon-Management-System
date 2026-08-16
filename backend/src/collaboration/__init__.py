@@ -1,0 +1,1 @@
+﻿"""Collaboration package for controlled multi-agent coordination."""
