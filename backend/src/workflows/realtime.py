@@ -62,7 +62,9 @@ class RealtimeTickEngine:
         # not the noisy measured value which can exceed rated power by ±1%.
         previous_storage_setpoint = float(inp.previous_values.get(
             "storage_power_setpoint_kw", previous_storage_power))
-        soc = float(inp.previous_values.get("storage_soc", 0.5))
+        soc = float(inp.previous_values.get(
+            "storage_soc", STORAGE_DEFAULTS["default_initial_soc_ratio"]
+        ))
         storage_temp = float(inp.previous_values.get(
             "storage_temp_c", STORAGE_DEFAULTS["ambient_temperature_c"]
         ))
@@ -192,8 +194,11 @@ class RealtimeTickEngine:
 
         if inp.demand_cap_kw is not None:
             planned_grid = load - solar - storage_sp - (baseline_hvac - hvac_sp)
-            storage_sp += max(0.0, planned_grid - inp.demand_cap_kw)
-            storage_sp = min(float(STORAGE_DEFAULTS["max_discharge_power_kw"]), storage_sp)
+            # Smart peak-shaving: only intervene if this step exceeds the cap
+            # AND would set a new monthly peak (no point wasting cycles otherwise).
+            if planned_grid > inp.demand_cap_kw and planned_grid > inp.monthly_peak_kw:
+                storage_sp += planned_grid - inp.demand_cap_kw
+                storage_sp = min(float(STORAGE_DEFAULTS["max_discharge_power_kw"]), storage_sp)
 
         for override in inp.pending_overrides.values():
             target = override.target.lower()

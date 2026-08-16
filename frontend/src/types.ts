@@ -125,11 +125,29 @@ export interface FacilityAction {
   reasoning: string
   confidence: number
   status: 'proposed' | 'confirmed' | 'applied' | 'cancelled' | 'failed'
+  target_day?: number | null
   created_at: string
   decided_at: string | null
   decided_by: string | null
   post_execution: Record<string, unknown> | null
   monitor_steps_remaining: number
+}
+
+export interface PendingDayPlan {
+  target_day: number
+  target_date: string
+  status: 'draft' | 'pending_approval' | 'approved' | 'executed'
+  gate_status: Record<string, string>
+  objective_mode: string
+  daily_soc_override: Record<string, number> | null
+  modifications: Array<Record<string, unknown>>
+  metrics: {
+    storage_saving_cny: number
+    storage_terminal_soc: number
+    hvac_saving_cny: number
+    hvac_avg_cop: number
+    peak_reduction_kw: number
+  }
 }
 
 export interface ChatMessage {
@@ -141,8 +159,9 @@ export interface ChatMessage {
   created_at: string
   event_ids: string[]
   facility_action_ids: string[]
-  tool_trace: Array<{ name: string; result: unknown }>
+  tool_trace: Array<{ name: string; summary?: string; result: unknown }>
   mode: 'user' | 'glm' | 'rule_fallback'
+  reasoning?: string
 }
 
 export interface LlmStatus {
@@ -166,6 +185,7 @@ export interface DayAheadData {
   soc_plan: number[]
   hvac_plan: number[]
   price: number[]
+  tariff_periods: string[]
   carbon_c: number[]
   carbon_cr: number[]
 }
@@ -292,5 +312,6 @@ export interface RuntimeState {
  disturbances: DisturbanceEvent[]
   current_phase: string
   facility_actions: FacilityAction[]
- active_strategy: { demand_cap_kw: number | null; enabled: boolean; objective_mode?: string }
+ active_strategy: { demand_cap_kw: number | null; enabled: boolean; objective_mode?: string; monthly_peak_kw?: number }
+  pending_day_plan: PendingDayPlan | null
 }

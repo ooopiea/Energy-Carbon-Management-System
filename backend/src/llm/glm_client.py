@@ -5,10 +5,11 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import httpx
+
+from core.config import read_project_env
 
 
 class GlmError(RuntimeError):
@@ -26,7 +27,7 @@ class GlmConfig:
 
     @classmethod
     def from_env(cls) -> "GlmConfig":
-        file_values = _read_project_env()
+        file_values = read_project_env()
         def value(name: str, default: str = "") -> str:
             return os.getenv(name, file_values.get(name, default))
         return cls(
@@ -44,26 +45,6 @@ class GlmConfig:
         )
 
 
-def _read_project_env() -> dict[str, str]:
-    """Read the project-local .env without mutating process environment."""
-    path = Path(__file__).resolve().parents[3] / ".env"
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    try:
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, raw_value = line.split("=", 1)
-            key = key.strip()
-            parsed = raw_value.strip()
-            if len(parsed) >= 2 and parsed[0] == parsed[-1] and parsed[0] in {'"', "'"}:
-                parsed = parsed[1:-1]
-            values[key] = parsed
-    except OSError:
-        return {}
-    return values
 
 
 @dataclass(frozen=True)
@@ -77,6 +58,7 @@ class GlmToolCall:
 class GlmMessage:
     content: str = ""
     tool_calls: list[GlmToolCall] = field(default_factory=list)
+    reasoning: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     def as_assistant_message(self) -> dict[str, Any]:
@@ -176,6 +158,8 @@ class GlmClient:
             message = payload["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise GlmError("GLM 响应缺少 choices[0].message") from exc
+        # GLM thinking=enabled returns reasoning_content alongside content.
+        reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
         calls: list[GlmToolCall] = []
         for raw_call in message.get("tool_calls") or []:
             function = raw_call.get("function") or {}
@@ -191,4 +175,4 @@ class GlmClient:
                     arguments=parsed,
                 )
             )
-        return GlmMessage(content=str(message.get("content") or ""), tool_calls=calls, raw=message)
+        return GlmMessage(content=str(message.get("content") or ""), tool_calls=calls, reasoning=reasoning, raw=message)

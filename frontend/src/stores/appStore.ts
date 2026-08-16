@@ -63,6 +63,7 @@ interface AppStore {
  decideDisturbance: (eventId: string, decision: 'apply' | 'cancel') => Promise<void>
   confirmFacilityAction: (proposalId: string) => Promise<void>
   cancelFacilityAction: (proposalId: string) => Promise<void>
+  reviseFacilityAction: (proposalId: string, parameters: Record<string, unknown>) => Promise<void>
   resumeMission: (missionId: string, humanInput: string) => Promise<void>
 }
 
@@ -294,38 +295,70 @@ export const useAppStore = create<AppStore>((set, get) => ({
       throw e
     }
   },
-  confirmFacilityAction: async (proposalId) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/facility-actions/${proposalId}/confirm`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ actor: get().chatRole }),
-      })
-      const body = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
-      if (body.state) set({ state: body.state })
-      get().recordAction('confirm facility action', proposalId, 'success')
-    } catch (e) {
-      get().recordAction('confirm facility action', proposalId, 'failed', e instanceof Error ? e.message : 'failed')
-      throw e
-    }
-  },
-  cancelFacilityAction: async (proposalId) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/facility-actions/${proposalId}/cancel`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ actor: get().chatRole }),
-      })
-      const body = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
-      if (body.state) set({ state: body.state })
-      get().recordAction('cancel facility action', proposalId, 'success')
-    } catch (e) {
-      get().recordAction('cancel facility action', proposalId, 'failed', e instanceof Error ? e.message : 'failed')
-      throw e
-    }
-  },
+ confirmFacilityAction: async (proposalId) => {
+   try {
+     const res = await fetch(`${API_BASE}/api/facility-actions/${proposalId}/confirm`, {
+       method: 'POST',
+       headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actor: get().chatRole === 'facility' ? '厂务值班员' : '值班工程师' }),
+     })
+     const body = await res.json().catch(() => ({}))
+     if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
+      if (body.state) set({ state: body.state }); else await get().fetchState()
+     get().recordAction('confirm facility action', proposalId, 'success')
+   } catch (e) {
+     get().recordAction('confirm facility action', proposalId, 'failed', e instanceof Error ? e.message : 'failed')
+     throw e
+   }
+ },
+ cancelFacilityAction: async (proposalId) => {
+   try {
+     const res = await fetch(`${API_BASE}/api/facility-actions/${proposalId}/cancel`, {
+       method: 'POST',
+       headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actor: get().chatRole === 'facility' ? '厂务值班员' : '值班工程师' }),
+     })
+     const body = await res.json().catch(() => ({}))
+     if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
+      if (body.state) set({ state: body.state }); else await get().fetchState()
+     get().recordAction('cancel facility action', proposalId, 'success')
+   } catch (e) {
+    get().recordAction('cancel facility action', proposalId, 'failed', e instanceof Error ? e.message : 'failed')
+    throw e
+  }
+},
+ reviseFacilityAction: async (proposalId, parameters) => {
+   try {
+     const res = await fetch(`${API_BASE}/api/facility-actions/${proposalId}/revise`, {
+       method: 'POST',
+       headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parameters, actor: get().chatRole === 'facility' ? '厂务值班员' : '值班工程师' }),
+     })
+     const body = await res.json().catch(() => ({}))
+     if (!res.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`)
+      if (body.state) set({ state: body.state }); else await get().fetchState()
+      // revise creates a new proposal_id; attach it to the latest
+      // assistant message so its action card renders in the chat.
+      const newId = body.action?.proposal_id
+      if (newId) {
+        set((s) => {
+          const msgs = [...s.chatMessages]
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role === 'assistant') {
+              const ids = [...new Set([...(msgs[i].facility_action_ids ?? []), newId])]
+              msgs[i] = { ...msgs[i], facility_action_ids: ids }
+              break
+            }
+          }
+          return { chatMessages: msgs }
+        })
+      }
+     get().recordAction('revise facility action', proposalId, 'success')
+   } catch (e) {
+     get().recordAction('revise facility action', proposalId, 'failed', e instanceof Error ? e.message : 'failed')
+     throw e
+   }
+ },
   resumeMission: async (missionId, humanInput) => {
     try {
       const res = await fetch(`${API_BASE}/api/mission/${missionId}/resume`, {

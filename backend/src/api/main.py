@@ -1,4 +1,4 @@
-"""Production-oriented FastAPI application for REST and WebSocket clients."""
+﻿"""Production-oriented FastAPI application for REST and WebSocket clients."""
 from __future__ import annotations
 
 import asyncio
@@ -78,6 +78,10 @@ class MissionResumeRequest(BaseModel):
 class FacilityActionDecisionRequest(BaseModel):
     actor: str = Field(default="facility", min_length=1, max_length=128)
 
+
+class FacilityActionReviseRequest(BaseModel):
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    actor: str = Field(default="facility", min_length=1, max_length=128)
 
 def _allowed_origins() -> list[str]:
     configured = os.getenv("ENERGY_CORS_ORIGINS", "")
@@ -316,6 +320,23 @@ def create_app(engine: SimulationEngine | None = None, start_background: bool = 
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await runtime_engine.broadcast_state()
         return {"action": action.model_dump(mode="json"), "state": runtime_engine.get_state()}
+
+    @application.post("/api/facility-actions/{proposal_id}/revise")
+    async def revise_facility_action(proposal_id: str, payload: FacilityActionReviseRequest):
+        try:
+            result = await runtime_engine.revise_facility_action(
+                proposal_id, payload.parameters, payload.actor)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ApprovalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await runtime_engine.broadcast_state()
+        return {"action": result["action"], "preview": result["preview"],
+                "state": runtime_engine.get_state()}
+
+    @application.get("/api/pending-day-plan")
+    async def get_pending_day_plan():
+        return runtime_engine.get_pending_day_plan()
 
     @application.post("/api/alerts/{alert_id}/acknowledge")
     async def acknowledge_alert(alert_id: str):

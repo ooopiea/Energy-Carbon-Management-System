@@ -214,11 +214,49 @@ class FacilityAction(BaseModel):
     reasoning: str = ""
     confidence: float = Field(default=0.8, ge=0.0, le=1.0)
     status: Literal["proposed", "confirmed", "applied", "cancelled", "failed"] = "proposed"
+    target_day: int | None = None
     created_at: datetime
     decided_at: datetime | None = None
     decided_by: str | None = None
     post_execution: dict[str, Any] | None = None
     monitor_steps_remaining: int = 0
+
+
+class PendingDayPlan(BaseModel):
+    """Next-day (D+1) day-ahead plan prepared during D-day for approval.
+
+    Lives alongside the active day's dispatch state. When the simulation clock
+    crosses into target_day, an approved plan is promoted to the live execution
+    plans; an unapproved plan falls back to auto-generated defaults.
+    """
+
+    target_day: int
+    target_date: str
+    day_data: dict[str, Any] = Field(default_factory=dict)
+    storage_plan: dict[str, Any] = Field(default_factory=dict)
+    hvac_plan: dict[str, Any] = Field(default_factory=dict)
+    carbon_data: dict[str, Any] | None = None
+    objective_mode: str = "weighted"
+    daily_soc_override: dict[str, float] | None = None
+    status: Literal["draft", "pending_approval", "approved", "executed"] = "draft"
+    gate_status: dict[str, str] = Field(default_factory=dict)
+    modifications: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: datetime
+
+    def all_gates_approved(self) -> bool:
+        needed = {"forecast_approval", "storage_approval", "hvac_approval"}
+        return all(self.gate_status.get(g) == "approved" for g in needed)
+
+    def metric_summary(self) -> dict[str, Any]:
+        sp = self.storage_plan or {}
+        hp = self.hvac_plan or {}
+        return {
+            "storage_saving_cny": sp.get("saving_cny", 0),
+            "storage_terminal_soc": sp.get("terminal_soc", 0),
+            "hvac_saving_cny": hp.get("saving_cny", 0),
+            "hvac_avg_cop": hp.get("avg_cop", 0),
+            "peak_reduction_kw": sp.get("peak_reduction_kw", 0),
+        }
 
 
 class TimeSeriesPoint(BaseModel):

@@ -65,8 +65,9 @@ def _make_tick_input(
             "storage_temp_c": 25.0, "hvac_supply_temp_c": 7.0,
             "hvac_return_temp_c": 12.0,
         },
-        demand_cap_kw=None, pending_overrides={},
-    )
+       demand_cap_kw=None, pending_overrides={},
+        monthly_peak_kw=0.0,
+   )
 
 
 @pytest.mark.asyncio

@@ -53,6 +53,7 @@ class TickInput:
     hvac_report_hash: str
     previous_values: dict[str, float]
     demand_cap_kw: float | None
+    monthly_peak_kw: float
     pending_overrides: dict[str, Any]
 
 

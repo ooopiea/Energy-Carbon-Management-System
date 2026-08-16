@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, Bot, Building2, Check, Clock3, Cpu, MessageSquareText, RotateCw, Send, ShieldCheck, Sparkles, TrendingDown, TrendingUp, UserRound, X, Zap } from 'lucide-react'
+import { Activity, Bot, Building2, Check, ChevronDown, Clock3, Cpu, MessageSquareText, Pencil, RotateCw, Send, ShieldCheck, Sparkles, TrendingDown, TrendingUp, UserRound, X, Zap } from 'lucide-react'
 import { useAppStore } from '../stores/appStore'
 import type { DisturbanceEvent, FacilityAction } from '../types'
 
@@ -54,10 +54,23 @@ function ActionPreviewCard({ preview }: { preview: Record<string, unknown> }) {
 function FacilityActionCard({ action }: { action: FacilityAction }) {
   const confirm = useAppStore(s => s.confirmFacilityAction)
   const cancel = useAppStore(s => s.cancelFacilityAction)
+  const revise = useAppStore(s => s.reviseFacilityAction)
   const [busy, setBusy] = useState(false)
-  const [decision, setDecision] = useState<'none' | 'confirm' | 'cancel'>('none')
-  const handleConfirm = async () => { setBusy(true); setDecision('confirm'); try { await confirm(action.proposal_id) } finally { setBusy(false) } }
-  const handleCancel = async () => { setBusy(true); setDecision('cancel'); try { await cancel(action.proposal_id) } finally { setBusy(false) } }
+  const [decision, setDecision] = useState<'none' | 'confirm' | 'cancel' | 'revise'>('none')
+  const [editing, setEditing] = useState(false)
+  const [editObjective, setEditObjective] = useState(action.parameters.objective_mode as string || 'weighted')
+  const [editTerminalSoc, setEditTerminalSoc] = useState(String(action.parameters.terminal_soc ?? ''))
+  const handleConfirm = async () => { setBusy(true); setDecision('confirm'); try { await confirm(action.proposal_id) } catch {} finally { setBusy(false); setDecision('none') } }
+  const handleCancel = async () => { setBusy(true); setDecision('cancel'); try { await cancel(action.proposal_id) } catch {} finally { setBusy(false); setDecision('none') } }
+  const handleRevise = async () => {
+    setBusy(true); setDecision('revise')
+    try {
+      const params: Record<string, unknown> = { objective_mode: editObjective }
+      if (editTerminalSoc) params.terminal_soc = parseFloat(editTerminalSoc)
+      await revise(action.proposal_id, params)
+      setEditing(false)
+    } finally { setBusy(false); setDecision('none') }
+  }
 
   const typeLabel: Record<string, string> = {
     day_ahead_modification: '日前参数修改', realtime_override: '实时覆盖',
@@ -66,20 +79,58 @@ function FacilityActionCard({ action }: { action: FacilityAction }) {
   const statusLabel: Record<string, string> = {
     proposed: '待确认', applied: '已执行', cancelled: '已取消', failed: '执行失败', confirmed: '已确认',
   }
+  const canRevise = action.action_type === 'day_ahead_modification' && action.status === 'proposed'
 
   return <article className={`facility-action-card ${action.status}`}>
     <header>
-      <div><span className="action-kicker">{typeLabel[action.action_type] ?? action.action_type} · {action.target_system}</span></div>
+      <div><span className="action-kicker">{typeLabel[action.action_type] ?? action.action_type} · {action.target_system}{action.target_day ? ` · D+${action.target_day}` : ''}</span></div>
       <span className="action-status">{statusLabel[action.status] ?? action.status}</span>
     </header>
     <p className="action-reasoning">{action.reasoning}</p>
     <ActionPreviewCard preview={action.impact_preview} />
+    {canRevise && editing && <div className="revise-editor">
+      <label>优化目标
+        <select value={editObjective} onChange={e => setEditObjective(e.target.value)}>
+          <option value="min_cost">省钱优先</option>
+          <option value="min_carbon">低碳优先</option>
+          <option value="weighted">平衡加权</option>
+        </select>
+      </label>
+      <label>末端SOC（0.1-0.9）
+        <input type="number" min={0.1} max={0.9} step={0.05} value={editTerminalSoc} onChange={e => setEditTerminalSoc(e.target.value)} placeholder="留空不变" />
+      </label>
+      <button disabled={busy} className="btn primary" onClick={() => void handleRevise()}><RotateCw />{busy && decision === 'revise' ? '重新计算…' : '重新预览'}</button>
+    </div>}
     {action.status === 'proposed' && <footer>
       <button disabled={busy} className="btn" onClick={() => void handleCancel()}><X />取消</button>
+      {canRevise && !editing && <button disabled={busy} className="btn" onClick={() => setEditing(true)}><Pencil />反馈修改</button>}
+      {canRevise && editing && <button disabled={busy} className="btn" onClick={() => setEditing(false)}><X />收起</button>}
       <button disabled={busy} className="btn primary" onClick={() => void handleConfirm()}><Check />{busy && decision === 'confirm' ? '正在执行…' : '确认执行'}</button>
     </footer>}
     {action.post_execution && <div className="post-exec">后置监控: 步骤 {String(action.post_execution.step ?? '?')}, 剩余 {action.monitor_steps_remaining} 步</div>}
   </article>
+}
+
+function ThinkingChainBlock({ reasoning, toolTrace }: { reasoning?: string; toolTrace: Array<{ name: string; summary?: string }> }) {
+  const [open, setOpen] = useState(false)
+  const hasContent = (reasoning && reasoning.trim()) || toolTrace.length > 0
+  if (!hasContent) return null
+  return <div className="thinking-chain">
+    <button className="thinking-toggle" onClick={() => setOpen(!open)}>
+      <ChevronDown className={`chevron ${open ? 'open' : ''}`} />
+      <span>思考链路</span>
+      <em>{toolTrace.length > 0 ? `${toolTrace.length} 步工具调用` : '深度推理'}</em>
+    </button>
+    {open && <div className="thinking-body">
+      {reasoning && reasoning.trim() && <div className="thinking-reasoning">
+        <strong>GLM 深度思考</strong>
+        <p>{reasoning}</p>
+      </div>}
+      {toolTrace.length > 0 && <ol className="tool-trace-list">
+        {toolTrace.map((t, i) => <li key={i}><code>{t.name}</code>{t.summary && <span>{t.summary}</span>}</li>)}
+      </ol>}
+    </div>}
+  </div>
 }
 
 function EventCard({ event }: { event: DisturbanceEvent }) {
@@ -163,6 +214,7 @@ export function FacilityChat() {
           <div className="message-body">
             <header><strong>{message.actor}</strong><span>{timeLabel(message.created_at)}</span>{message.mode === 'glm' && <em>GLM</em>}{message.mode === 'rule_fallback' && <em className="fallback">降级</em>}</header>
             <p>{message.content}</p>
+            {message.role === 'assistant' && <ThinkingChainBlock reasoning={message.reasoning} toolTrace={message.tool_trace} />}
             {(message.event_ids ?? []).map(id => eventMap.get(id)).filter((e): e is DisturbanceEvent => Boolean(e)).map(e => <EventCard event={e} key={e.event_id} />)}
             {(message.facility_action_ids ?? []).map(id => actionMap.get(id)).filter((a): a is FacilityAction => Boolean(a)).map(a => <FacilityActionCard action={a} key={a.proposal_id} />)}
           </div>

@@ -7,6 +7,37 @@ from datetime import date
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # backend/
+PROJECT_ROOT = BASE_DIR.parent  # v3_energy_management/
+
+
+def read_project_env() -> dict[str, str]:
+    """Read the project-local .env file without mutating process environment."""
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            key = key.strip()
+            parsed = raw_value.strip()
+            if len(parsed) >= 2 and parsed[0] == parsed[-1] and parsed[0] in {'"', "'"}:
+                parsed = parsed[1:-1]
+            values[key] = parsed
+    except OSError:
+        return {}
+    return values
+
+
+def get_env(key: str, default: str = "") -> str:
+    """Resolve a config value: os.environ first, then project .env, then default."""
+    val = os.getenv(key)
+    if val is None:
+        val = read_project_env().get(key)
+    return val if val is not None else default
 DATA_DIR = BASE_DIR / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 SIMULATED_DIR = DATA_DIR / "simulated"
@@ -47,6 +78,9 @@ STORAGE_DEFAULTS = {
     "max_discharge_power_kw": SITE_STORAGE_POWER_KW,
     "min_soc_ratio": 0.10,
     "max_soc_ratio": 0.90,
+    # 每日起始/结束默认 SOC（与 min_soc_ratio 对齐，可被日前修改覆盖）。
+    "default_initial_soc_ratio": 0.10,
+    "default_terminal_soc_ratio": 0.10,
     "charge_efficiency_ratio": 0.90,
     "discharge_efficiency_ratio": 0.90,
     # 轻量正则项：抑制同价值方案中的无意义充/放模式反复切换。

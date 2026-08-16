@@ -1,4 +1,4 @@
-"""LangGraph-driven industrial energy simulation and approval-safe execution."""
+﻿"""LangGraph-driven industrial energy simulation and approval-safe execution."""
 from __future__ import annotations
 
 import asyncio
@@ -23,6 +23,7 @@ from core.config import (
     SIM_STEP_MINUTES,
     STORAGE_DEFAULTS,
     TARIFF_PRICES,
+    get_env,
     get_tariff_period,
 )
 from core.executor import ExecutionRejected, SimulationExecutor
@@ -41,6 +42,7 @@ from core.state import (
     PhysicsConstraints,
     Severity,
 )
+from core.state import PendingDayPlan
 from core.time_engine import TimeEngine, get_time_engine
 from data.raw_loader import get_load_data_range, process_load_to_15min
 from data.simulator import generate_day_ahead_data
@@ -58,6 +60,12 @@ from repositories.state_repository import (
 
 class ApprovalError(ValueError):
     pass
+
+# Storage SOC daily boundary defaults (R5): each day starts and ends at min safe level.
+# Single source of truth lives in config.STORAGE_DEFAULTS; these aliases keep
+# existing imports working while reading from the same configuration dict.
+STORAGE_DEFAULT_INITIAL_SOC = float(STORAGE_DEFAULTS["default_initial_soc_ratio"])
+STORAGE_DEFAULT_TERMINAL_SOC = float(STORAGE_DEFAULTS["default_terminal_soc_ratio"])
 
 
 class ApprovalNotFound(ApprovalError):
@@ -109,7 +117,7 @@ class SimulationEngine:
         self._broadcast_lock = asyncio.Lock()
         self._ws_clients: set[Any] = set()
         self._ws_lock = threading.RLock()
-        self._auto_approve = os.getenv("ENERGY_AUTO_APPROVE", "false").strip().lower() in {
+        self._auto_approve = get_env("ENERGY_AUTO_APPROVE", "false").strip().lower() in {
             "1",
             "true",
             "yes",
@@ -172,9 +180,13 @@ class SimulationEngine:
         self._acked_steps: set[int] = set()
         self._current_values = self._empty_current_values()
         self._demand_cap_kw: float | None = None
+        self._monthly_peak_kw: float = 0.0
+        self._monthly_peak_month: int | None = None
+        self._daily_soc_override: dict[str, float] | None = None
         self._objective_mode: str = "weighted"
         self._pending_overrides = {}
         self._init_nodes()
+        self._pending_day_plan: PendingDayPlan | None = None
 
     def _restore_from_checkpoint(self, run_id: str) -> bool:
         """Restore workflow state from a saved checkpoint (G4 restart-resume).
@@ -217,7 +229,7 @@ class SimulationEngine:
             "solar_kw": 0.0,
             "grid_kw": 0.0,
             "storage_power_kw": 0.0,
-            "storage_soc": 0.5,
+            "storage_soc": STORAGE_DEFAULT_INITIAL_SOC,
             "storage_temp_c": 25.0,
             "hvac_power_kw": 0.0,
             "hvac_supply_temp_c": 7.0,
@@ -256,7 +268,9 @@ class SimulationEngine:
             )
 
     def _prepare_day(self, day: int) -> None:
-        previous_storage_soc = float(self._current_values.get("storage_soc", 0.5))
+        previous_storage_soc = float(
+            self._current_values.get("storage_soc", STORAGE_DEFAULT_INITIAL_SOC)
+        )
         self._day_data = None
         self._storage_plan = None
         self._hvac_plan = None
@@ -270,6 +284,7 @@ class SimulationEngine:
         self._dispatch_enabled = False
         self._last_execution = None
         self._objective_mode = "weighted"
+        self._daily_soc_override = None
         self._command_count = 0
         self._acked_commands = {}
         self._acked_steps = set()
@@ -289,17 +304,159 @@ class SimulationEngine:
         }
         self._init_nodes()
 
+    def _sync_realtime_soc_to_plan(self) -> None:
+        """Align realtime SOC to the day-ahead plan's initial_soc.
+
+        Called after the day-ahead workflow (or facility-driven re-optimization)
+        produces a storage plan, but only before any realtime tick has run for
+        the day. This guarantees the realtime feedback curve shares the same
+        origin as the SOC plan, so they overlap on the frontend chart.
+        """
+        if self._storage_plan and self._last_step < 0:
+            self._current_values["storage_soc"] = float(
+                self._storage_plan["initial_soc"]
+            )
+
     async def start_day(self, day: int) -> None:
         async with self._transition_lock:
             await self._start_day_locked(day)
 
     async def _start_day_locked(self, day: int) -> None:
+        promoted = False
+        if (
+            day > 0
+            and self._pending_day_plan is not None
+            and self._pending_day_plan.target_day == day
+            and self._pending_day_plan.status == "approved"
+        ):
+            promoted = await self._promote_pending_day_locked(day)
+        if not promoted:
+            self._prepare_day(day)
+            await self._invoke_graph_locked()
+            self._sync_realtime_soc_to_plan()
+            if self._auto_approve:
+                await self._auto_approve_all_gates_locked()
+        self._generate_next_day_plan_locked(day + 1)
+
+    async def _auto_approve_all_gates_locked(self) -> None:
+        """Auto-approve all three gates (day 0 and unapproved-next-day fallback)."""
+        await self._submit_approval_locked("forecast_approval", "approve", "自动审批", "system")
+        await self._submit_approval_locked("storage_approval", "approve", "自动审批", "system")
+        await self._submit_approval_locked("hvac_approval", "approve", "自动审批", "system")
+
+    async def _promote_pending_day_locked(self, day: int) -> bool:
+        """Promote an approved PendingDayPlan to the live execution state."""
+        plan = self._pending_day_plan
+        if plan is None or not plan.storage_plan or not plan.hvac_plan:
+            return False
         self._prepare_day(day)
-        await self._invoke_graph_locked()
-        if self._auto_approve:
-            await self._submit_approval_locked("forecast_approval", "approve", "自动审批", "system")
-            await self._submit_approval_locked("storage_approval", "approve", "自动审批", "system")
-            await self._submit_approval_locked("hvac_approval", "approve", "自动审批", "system")
+        self._day_data = plan.day_data
+        self._carbon_data = plan.carbon_data
+        self._storage_plan = dict(plan.storage_plan)
+        self._hvac_plan = dict(plan.hvac_plan)
+        self._objective_mode = plan.objective_mode
+        self._daily_soc_override = dict(plan.daily_soc_override) if plan.daily_soc_override else None
+        if self._day_data:
+            self._apply_disturbances_to_day_data(self._day_data, self._time.sim_time.date())
+        self._sync_realtime_soc_to_plan()
+        storage_report = self._add_report(
+            AgentType.STORAGE, "次日储能调度报告（审批通过）",
+            f"已审批方案提升为执行方案，省{self._storage_plan['saving_cny']:.0f}元",
+            {**self._storage_plan, "report_detail": self._build_report_detail("storage", self._storage_plan)},
+        )
+        hvac_report = self._add_report(
+            AgentType.HVAC, "次日HVAC调度报告（审批通过）",
+            f"已审批方案提升为执行方案，省{self._hvac_plan['saving_cny']:.0f}元",
+            {**self._hvac_plan, "report_detail": self._build_report_detail("hvac", self._hvac_plan)},
+        )
+        forecast = self._day_data.get("load_forecast", [])
+        forecast_report = self._add_report(
+            AgentType.PREDICTION, "次日负荷预测（审批通过）",
+            f"已审批预测方案，峰值{max(forecast) if forecast else 0:.0f} kW",
+            {"forecast_kw": forecast, "peak": max(forecast) if forecast else 0,
+             "mean": sum(forecast) / len(forecast) if forecast else 0,
+             "peak_step": forecast.index(max(forecast)) if forecast else 0,
+             "report_detail": self._build_report_detail("forecast", {
+                 "forecast_kw": forecast, "peak": max(forecast) if forecast else 0,
+                 "mean": sum(forecast) / len(forecast) if forecast else 0,
+                 "peak_step": forecast.index(max(forecast)) if forecast else 0})},
+        )
+        self._bind_gate("forecast_approval", forecast_report, "已审批")
+        self._bind_gate("storage_approval", storage_report, f"省{self._storage_plan['saving_cny']:.0f}元")
+        self._bind_gate("hvac_approval", hvac_report, f"省{self._hvac_plan['saving_cny']:.0f}元")
+        self._approval_gates["forecast_approval"].status = NodeStatus.APPROVED
+        self._approval_gates["storage_approval"].status = NodeStatus.APPROVED
+        self._approval_gates["hvac_approval"].status = NodeStatus.APPROVED
+        self._dispatch_enabled = True
+        self._finalize_day_ahead_accounting()
+        plan.status = "executed"
+        self._pending_day_plan = None
+        self._workflow_state["workflow_status"] = "active"
+        self._workflow_state["current_node"] = "physical_dispatch"
+        self._set_node("monitor", NodeStatus.COMPLETED, "已审批次日方案直接提升为执行方案")
+        self._save_checkpoint()
+        return True
+
+    def _generate_next_day_plan_locked(self, next_day: int) -> None:
+        """Pre-generate D+1 day-ahead plan for review and approval during D-day."""
+        sim_time = self._time.sim_time
+        next_date = sim_time.date() + timedelta(days=1)
+        try:
+            next_data = generate_day_ahead_data(next_day, next_date.month, next_date)
+        except Exception:
+            return
+        midnight = datetime.combine(next_date, datetime.min.time())
+        next_data["timestamps"] = [
+            midnight + timedelta(minutes=15 * i) for i in range(POINTS_PER_DAY)
+        ]
+        next_data["tariff_periods"] = [
+            get_tariff_period(i / 4.0, next_date.month) for i in range(POINTS_PER_DAY)
+        ]
+        next_data["price_cny_per_kwh"] = [TARIFF_PRICES[p] for p in next_data["tariff_periods"]]
+        # Process load data to 15-min resolution (same as prediction agent).
+        source_res = int(next_data.get("data_provenance", {}).get("load", {}).get("resolution_minutes", 15))
+        processed_load, _ = process_load_to_15min(next_data["load_kw"], source_res)
+        next_data["load_kw"] = processed_load
+        next_data["load_forecast"] = list(processed_load)
+        carbon = compute_carbon_factors(
+            next_data["generation_mix"],
+            external_cr_factors=next_data.get("cr_factors"),
+        )
+        storage_plan = optimize_storage_dispatch(
+            next_data["load_forecast"],
+            next_data["price_cny_per_kwh"],
+            carbon_factors=carbon["c_factors"],
+            objective="weighted",
+            carbon_price_cny_per_ton=80.0,
+            initial_soc=STORAGE_DEFAULT_INITIAL_SOC,
+            terminal_soc=STORAGE_DEFAULT_TERMINAL_SOC,
+            solar_kw=next_data["solar_kw"],
+            max_power_kw_series=next_data.get("storage_power_limit_kw"),
+            ambient_temp_c_series=next_data["weather"]["temp_c"],
+        )
+        hvac_plan = optimize_hvac_dispatch(
+            next_data["hvac_load_kw"],
+            next_data["weather"]["temp_c"],
+            next_data["price_cny_per_kwh"],
+            next_data["tariff_periods"],
+            available_chillers=next_data.get("available_chillers"),
+        )
+        self._pending_day_plan = PendingDayPlan(
+            target_day=next_day,
+            target_date=next_date.isoformat(),
+            day_data=next_data,
+            storage_plan=storage_plan,
+            hvac_plan=hvac_plan,
+            carbon_data=carbon,
+            objective_mode="weighted",
+            gate_status={
+                "forecast_approval": "approved",
+                "storage_approval": "approved",
+                "hvac_approval": "approved",
+            },
+            created_at=sim_time,
+        )
+        self._pending_day_plan.status = "approved"
 
     async def _invoke_graph_locked(self) -> None:
         result = await self._graph.ainvoke(self._workflow_state)
@@ -506,17 +663,24 @@ class SimulationEngine:
             external_cr_factors=self._day_data.get("cr_factors"),
         )
         self._set_node("storage_dispatch", NodeStatus.RUNNING)
+        soc_override = self._daily_soc_override or {}
+        initial_soc = float(soc_override.get("initial_soc", STORAGE_DEFAULT_INITIAL_SOC))
+        terminal_soc = float(soc_override.get("terminal_soc", STORAGE_DEFAULT_TERMINAL_SOC))
         self._storage_plan = optimize_storage_dispatch(
             self._day_data["load_forecast"],
             self._day_data["price_cny_per_kwh"],
             carbon_factors=self._carbon_data["c_factors"],
             objective=self._objective_mode,
             carbon_price_cny_per_ton=80.0,
-            initial_soc=float(self._current_values.get("storage_soc", 0.5)),
+            initial_soc=initial_soc,
+            terminal_soc=terminal_soc,
             solar_kw=self._day_data["solar_kw"],
             max_power_kw_series=self._day_data.get("storage_power_limit_kw"),
             ambient_temp_c_series=self._day_data["weather"]["temp_c"],
         )
+        # Align realtime SOC origin to the plan's initial_soc so the two
+        # curves (day-ahead plan vs realtime feedback) share the same start.
+        self._sync_realtime_soc_to_plan()
         storage_facts = {
             "saving_cny": self._storage_plan["saving_cny"],
             "terminal_soc": self._storage_plan["terminal_soc"],
@@ -798,63 +962,70 @@ class SimulationEngine:
         unit: str,
         reason: str,
         actor: str,
-    ) -> ControlActionRecord:
-        """Validate, archive and queue a manual action for the next physical step."""
-        async with self._transition_lock:
-            if system not in {"overview", "storage", "hvac"}:
-                raise InvalidControlAction(f"未知控制系统: {system}")
-            if not action.strip() or not target.strip() or not actor.strip():
-                raise InvalidControlAction("action、target 和 actor 不得为空")
-            if system in {"storage", "hvac"}:
-                gate_id = f"{system}_approval"
-                if self._approval_gates[gate_id].status != NodeStatus.APPROVED:
-                    raise ApprovalConflict(f"{system} 调度报告尚未批准，拒绝物理设定")
-                self._validate_physical_action(system, target, value)
-                # Mark any previously pending override for this system as superseded.
-                existing = self._pending_overrides.get(system)
-                if existing is not None:
-                    existing.status = "rejected"
-                    existing.applied_step = self._time.current_step
-                    self._archive.archive_control_action(
-                        existing, self._time.sim_time.date(), self._run_id,
-                        event_type="control_action_superseded",
-                    )
-            elif target.strip().lower() != "demand_cap_kw":
-                raise InvalidControlAction("园区策略当前仅支持 demand_cap_kw")
+   ) -> ControlActionRecord:
+       """Validate, archive and queue a manual action for the next physical step."""
+       async with self._transition_lock:
+            return await self._submit_control_action_locked(
+                system=system, action=action, target=target, value=value,
+                unit=unit, reason=reason, actor=actor,
+            )
 
-            record = ControlActionRecord(
-                action_id=f"act-{uuid.uuid4().hex[:12]}",
-                run_id=self._run_id,
-                system=system,
-                action=action.strip(),
-                target=target.strip(),
-                value=value,
-                unit=unit.strip(),
-                reason=reason.strip(),
-                actor=actor.strip(),
-                submitted_at=self._time.sim_time,
-                status="executed" if system == "overview" else "accepted",
-                applied_step=self._time.current_step if system == "overview" else None,
-            )
-            self._control_actions.insert(0, record)
-            self._control_actions = self._control_actions[:100]
-            self._archive.archive_control_action(
-                record, self._time.sim_time.date(), self._run_id
-            )
-            if system in {"storage", "hvac"}:
-                # Latest validated operator setpoint wins for that subsystem.
-                self._pending_overrides[system] = record
-            else:
-                self._demand_cap_kw = value if value > 0 else None
-                self._objective_mode = self._parse_objective_mode(reason)
+    async def _submit_control_action_locked(
+        self, *, system: str, action: str, target: str, value: float,
+        unit: str, reason: str, actor: str,
+    ) -> ControlActionRecord:
+        """Core control-action logic; caller must already hold _transition_lock."""
+        if system not in {"overview", "storage", "hvac"}:
+            raise InvalidControlAction(f"未知控制系统: {system}")
+        if not action.strip() or not target.strip() or not actor.strip():
+            raise InvalidControlAction("action、target 和 actor 不得为空")
+        if system in {"storage", "hvac"}:
+            gate_id = f"{system}_approval"
+            if self._approval_gates[gate_id].status != NodeStatus.APPROVED:
+                raise ApprovalConflict(f"{system} 调度报告尚未批准，拒绝物理设定")
+            self._validate_physical_action(system, target, value)
+            existing = self._pending_overrides.get(system)
+            if existing is not None:
+                existing.status = "rejected"
+                existing.applied_step = self._time.current_step
                 self._archive.archive_control_action(
-                    record,
-                    self._time.sim_time.date(),
-                    self._run_id,
-                    event_type="control_action_executed",
+                    existing, self._time.sim_time.date(), self._run_id,
+                    event_type="control_action_superseded",
                 )
-            self._save_checkpoint()
-            return record
+        elif target.strip().lower() != "demand_cap_kw":
+            raise InvalidControlAction("园区策略当前仅支持 demand_cap_kw")
+        record = ControlActionRecord(
+            action_id=f"act-{uuid.uuid4().hex[:12]}",
+            run_id=self._run_id,
+            system=system,
+            action=action.strip(),
+            target=target.strip(),
+            value=value,
+            unit=unit.strip(),
+            reason=reason.strip(),
+            actor=actor.strip(),
+            submitted_at=self._time.sim_time,
+            status="executed" if system == "overview" else "accepted",
+            applied_step=self._time.current_step if system == "overview" else None,
+        )
+        self._control_actions.insert(0, record)
+        self._control_actions = self._control_actions[:100]
+        self._archive.archive_control_action(
+            record, self._time.sim_time.date(), self._run_id
+        )
+        if system in {"storage", "hvac"}:
+            self._pending_overrides[system] = record
+        else:
+            self._demand_cap_kw = value if value > 0 else None
+            self._objective_mode = self._parse_objective_mode(reason)
+            self._archive.archive_control_action(
+                record,
+                self._time.sim_time.date(),
+                self._run_id,
+                event_type="control_action_executed",
+            )
+        self._save_checkpoint()
+        return record
 
     @staticmethod
     def _parse_objective_mode(reason: str) -> str:
@@ -932,6 +1103,7 @@ class SimulationEngine:
             hvac_report_hash=hvac_gate.report_hash or "",
             previous_values=self._current_values,
             demand_cap_kw=self._demand_cap_kw,
+            monthly_peak_kw=self._monthly_peak_kw,
             pending_overrides=self._pending_overrides,
         )
 
@@ -1036,6 +1208,14 @@ class SimulationEngine:
             ts.date(),
             self._run_id,
         )
+
+        # Track monthly peak demand for smart peak-shaving (R3).
+        current_month = self._time.sim_time.month
+        if self._monthly_peak_month != current_month:
+            self._monthly_peak_kw = 0.0
+            self._monthly_peak_month = current_month
+        if m["grid_kw"] > self._monthly_peak_kw:
+            self._monthly_peak_kw = m["grid_kw"]
 
         await self._monitor_check(
             step, m["storage_soc"], m["storage_temp_c"],
@@ -1350,6 +1530,217 @@ class SimulationEngine:
         bounded = max(1, min(limit, 200))
         return [item.model_dump(mode="json") for item in self._facility_actions[:bounded]]
 
+    def get_pending_day_plan(self) -> dict[str, Any] | None:
+        """Return the D+1 pending plan snapshot for the frontend / chat service."""
+        if self._pending_day_plan is None:
+            return None
+        p = self._pending_day_plan
+        return {
+            "target_day": p.target_day,
+            "target_date": p.target_date,
+            "status": p.status,
+            "gate_status": p.gate_status,
+            "objective_mode": p.objective_mode,
+            "daily_soc_override": p.daily_soc_override,
+            "modifications": p.modifications,
+            "metrics": p.metric_summary(),
+        }
+
+    def preview_next_day_modification(
+        self,
+        *,
+        target_system: str = "storage",
+        objective_mode: str = "weighted",
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Shadow-optimise on the pending D+1 day_data and return before/after metrics."""
+        plan = self._pending_day_plan
+        if plan is None or not plan.day_data:
+            return {"before": {}, "after": {}, "diff": {}, "error": "no pending day plan"}
+        params = parameters or {}
+        before = plan.metric_summary()
+        after_storage: dict[str, Any] = {}
+        after_hvac: dict[str, Any] = {}
+        soc_ov = plan.daily_soc_override or {}
+        if target_system in ("storage", "overview"):
+            initial_soc = float(params.get("initial_soc", soc_ov.get("initial_soc", STORAGE_DEFAULT_INITIAL_SOC)))
+            terminal_soc = float(params.get("terminal_soc", soc_ov.get("terminal_soc", STORAGE_DEFAULT_TERMINAL_SOC)))
+            sp = optimize_storage_dispatch(
+                plan.day_data["load_forecast"],
+                plan.day_data["price_cny_per_kwh"],
+                carbon_factors=plan.carbon_data["c_factors"] if plan.carbon_data else None,
+                objective=objective_mode,
+                carbon_price_cny_per_ton=params.get("carbon_price_cny_per_ton", 80.0),
+                initial_soc=initial_soc,
+                terminal_soc=terminal_soc,
+                solar_kw=plan.day_data["solar_kw"],
+                max_power_kw_series=self._resolve_power_limit_series(params),
+                ambient_temp_c_series=plan.day_data["weather"]["temp_c"],
+            )
+            after_storage = {
+                "storage_saving_cny": sp.get("saving_cny", 0),
+                "storage_terminal_soc": sp.get("terminal_soc", 0),
+                "peak_reduction_kw": sp.get("peak_reduction_kw", 0),
+            }
+        if target_system in ("hvac", "overview"):
+            hp = optimize_hvac_dispatch(
+                plan.day_data["hvac_load_kw"],
+                plan.day_data["weather"]["temp_c"],
+                plan.day_data["price_cny_per_kwh"],
+                plan.day_data["tariff_periods"],
+                available_chillers=self._resolve_chiller_override(params),
+            )
+            after_hvac = {
+                "hvac_saving_cny": hp.get("saving_cny", 0),
+                "hvac_avg_cop": hp.get("avg_cop", 0),
+            }
+        after = {**after_storage, **after_hvac}
+        diff = {k: round(after.get(k, 0) - before.get(k, 0), 2) for k in set(list(before) + list(after))}
+        return {"before": before, "after": after, "diff": diff}
+
+    async def apply_next_day_modification(
+        self,
+        *,
+        target_system: str = "storage",
+        objective_mode: str = "weighted",
+        parameters: dict[str, Any] | None = None,
+        reasoning: str = "",
+        confidence: float = 0.8,
+        actor: str = "facility",
+    ) -> FacilityAction:
+        """Write a modification into the pending D+1 plan and create a FacilityAction."""
+        async with self._transition_lock:
+            return await self._apply_next_day_modification_locked(
+                target_system=target_system, objective_mode=objective_mode,
+                parameters=parameters, reasoning=reasoning,
+                confidence=confidence, actor=actor,
+            )
+
+    async def _apply_next_day_modification_locked(
+        self, *, target_system: str = "storage", objective_mode: str = "weighted",
+        parameters: dict[str, Any] | None = None, reasoning: str = "",
+        confidence: float = 0.8, actor: str = "facility",
+    ) -> FacilityAction:
+        """Core D+1 modification logic; caller must already hold _transition_lock."""
+        plan = self._pending_day_plan
+        if plan is None:
+            raise ValueError("no pending day plan available")
+        params = parameters or {}
+        full_params: dict[str, Any] = {**params}
+        if objective_mode:
+            full_params["objective_mode"] = objective_mode
+        soc_ov = dict(plan.daily_soc_override or {})
+        if "initial_soc" in params:
+            soc_ov["initial_soc"] = float(params["initial_soc"])
+        if "terminal_soc" in params:
+            soc_ov["terminal_soc"] = float(params["terminal_soc"])
+        plan.daily_soc_override = soc_ov or None
+        if "power_limit_windows" in params:
+            plan.day_data["storage_power_limit_kw"] = self._resolve_power_limit_series(params)
+        if "available_chillers_override" in params:
+            plan.day_data["available_chillers"] = self._resolve_chiller_override(params)
+        if target_system in ("storage", "overview"):
+            sp = optimize_storage_dispatch(
+                plan.day_data["load_forecast"],
+                plan.day_data["price_cny_per_kwh"],
+                carbon_factors=plan.carbon_data["c_factors"] if plan.carbon_data else None,
+                objective=objective_mode,
+                carbon_price_cny_per_ton=params.get("carbon_price_cny_per_ton", 80.0),
+                initial_soc=float(soc_ov.get("initial_soc", STORAGE_DEFAULT_INITIAL_SOC)),
+                terminal_soc=float(soc_ov.get("terminal_soc", STORAGE_DEFAULT_TERMINAL_SOC)),
+                solar_kw=plan.day_data["solar_kw"],
+                max_power_kw_series=plan.day_data.get("storage_power_limit_kw"),
+                ambient_temp_c_series=plan.day_data["weather"]["temp_c"],
+            )
+            plan.storage_plan = sp
+            plan.objective_mode = objective_mode
+        if target_system in ("hvac", "overview"):
+            hp = optimize_hvac_dispatch(
+                plan.day_data["hvac_load_kw"],
+                plan.day_data["weather"]["temp_c"],
+                plan.day_data["price_cny_per_kwh"],
+                plan.day_data["tariff_periods"],
+                available_chillers=plan.day_data.get("available_chillers"),
+            )
+            plan.hvac_plan = hp
+        preview = self.preview_next_day_modification(
+            target_system=target_system, objective_mode=objective_mode, parameters=params)
+        action = FacilityAction(
+            proposal_id=f"fac-{uuid.uuid4().hex[:10]}",
+            action_type="day_ahead_modification",
+            target_system=target_system,
+            parameters=full_params,
+            impact_preview=preview,
+            reasoning=reasoning,
+            confidence=confidence,
+            target_day=plan.target_day,
+            created_at=self._time.sim_time,
+        )
+        self._facility_actions.insert(0, action)
+        self._facility_actions = self._facility_actions[:200]
+        plan.modifications.append({
+            "target_system": target_system,
+            "objective_mode": objective_mode,
+            "parameters": full_params,
+            "reasoning": reasoning,
+            "proposal_id": action.proposal_id,
+            "at": self._time.sim_time.isoformat(),
+        })
+        return action
+
+    async def confirm_next_day_modification(self, proposal_id: str, actor: str) -> FacilityAction:
+        """Confirm a pending D+1 modification action."""
+        action = next((a for a in self._facility_actions if a.proposal_id == proposal_id), None)
+        if action is None:
+            raise LookupError(f"facility action not found: {proposal_id}")
+        if action.status != "proposed":
+            raise ApprovalConflict(f"action {proposal_id} already processed: {action.status}")
+        action.status = "applied"
+        action.decided_at = self._time.sim_time
+        action.decided_by = actor
+        action.monitor_steps_remaining = 24
+        if self._pending_day_plan and self._pending_day_plan.target_day == action.target_day:
+            p = self._pending_day_plan
+            if "objective_mode" in action.parameters:
+                p.objective_mode = action.parameters["objective_mode"]
+            p.status = "approved"
+        self._save_checkpoint()
+        return action
+
+    async def revise_facility_action(
+        self, proposal_id: str, parameters: dict[str, Any], actor: str
+    ) -> dict[str, Any]:
+        """Cancel an old proposal and create a revised one with new parameters + fresh preview."""
+        old = next((a for a in self._facility_actions if a.proposal_id == proposal_id), None)
+        if old is None:
+            raise LookupError(f"facility action not found: {proposal_id}")
+        if old.status != "proposed":
+            raise ApprovalConflict(f"action {proposal_id} already processed: {old.status}")
+        old.status = "cancelled"
+        old.decided_at = self._time.sim_time
+        old.decided_by = actor
+        new_params = {**old.parameters, **parameters}
+        objective_mode = str(new_params.get("objective_mode", old.parameters.get("objective_mode", "weighted")))
+        target_system = old.target_system
+        preview = self.preview_next_day_modification(
+            target_system=target_system, objective_mode=objective_mode,
+            parameters={k: v for k, v in new_params.items() if k != "objective_mode"})
+        action = FacilityAction(
+            proposal_id=f"fac-{uuid.uuid4().hex[:10]}",
+            action_type=old.action_type,
+            target_system=target_system,
+            parameters=new_params,
+            impact_preview=preview,
+            reasoning=old.reasoning,
+            confidence=old.confidence,
+            target_day=old.target_day,
+            created_at=self._time.sim_time,
+        )
+        self._facility_actions.insert(0, action)
+        self._facility_actions = self._facility_actions[:200]
+        return {"proposal_id": action.proposal_id, "action": action.model_dump(mode="json"),
+                "preview": preview}
+
     async def propose_facility_action(
         self,
         *,
@@ -1395,7 +1786,13 @@ class SimulationEngine:
             action.decided_by = actor
 
             if action.action_type == "day_ahead_modification":
-                await self._apply_day_ahead_modification_locked(action)
+                if action.target_day is not None:
+                    # D+1 next-day modification: already applied to pending plan
+                    # at proposal time; just mark confirmed and update plan status.
+                    if self._pending_day_plan and self._pending_day_plan.target_day == action.target_day:
+                        self._pending_day_plan.status = "approved"
+                else:
+                    await self._apply_day_ahead_modification_locked(action)
             elif action.action_type == "realtime_override":
                 await self._apply_realtime_override_locked(action, actor)
             elif action.action_type == "demand_cap":
@@ -1464,20 +1861,21 @@ class SimulationEngine:
         self, objective_mode: str, params: dict[str, Any]
     ) -> dict[str, Any]:
         assert self._day_data is not None
+        soc_override = self._daily_soc_override or {}
+        initial_soc = float(params.get("initial_soc", soc_override.get("initial_soc", STORAGE_DEFAULT_INITIAL_SOC)))
+        terminal_soc = float(params.get("terminal_soc", soc_override.get("terminal_soc", STORAGE_DEFAULT_TERMINAL_SOC)))
         kwargs: dict[str, Any] = dict(
             load_kw=self._day_data["load_forecast"],
             price_cny_per_kwh=self._day_data["price_cny_per_kwh"],
             carbon_factors=self._carbon_data["c_factors"] if self._carbon_data else None,
             objective=objective_mode,
             carbon_price_cny_per_ton=params.get("carbon_price_cny_per_ton", 80.0),
-            initial_soc=float(self._current_values.get("storage_soc", 0.5)),
+            initial_soc=initial_soc,
+            terminal_soc=terminal_soc,
             solar_kw=self._day_data["solar_kw"],
             max_power_kw_series=self._resolve_power_limit_series(params),
             ambient_temp_c_series=self._day_data["weather"]["temp_c"],
         )
-        terminal_soc = params.get("terminal_soc")
-        if terminal_soc is not None:
-            kwargs["terminal_soc"] = float(terminal_soc)
         plan = optimize_storage_dispatch(**kwargs)
         return {
             "storage_saving_cny": plan.get("saving_cny", 0),
@@ -1570,18 +1968,28 @@ class SimulationEngine:
 
         if self._day_data and self._carbon_data:
             terminal_soc = params.get("terminal_soc")
+            initial_soc_override = params.get("initial_soc")
+            soc_override = self._daily_soc_override or {}
+            if initial_soc_override is not None or terminal_soc is not None:
+                override = dict(soc_override)
+                if initial_soc_override is not None:
+                    override["initial_soc"] = float(initial_soc_override)
+                if terminal_soc is not None:
+                    override["terminal_soc"] = float(terminal_soc)
+                self._daily_soc_override = override
             if target in ("storage", "overview"):
+                soc_ov = self._daily_soc_override or {}
                 self._storage_plan = optimize_storage_dispatch(
                     self._day_data["load_forecast"],
                     self._day_data["price_cny_per_kwh"],
                     carbon_factors=self._carbon_data["c_factors"],
                     objective=self._objective_mode,
                     carbon_price_cny_per_ton=params.get("carbon_price_cny_per_ton", 80.0),
-                    initial_soc=float(self._current_values.get("storage_soc", 0.5)),
+                    initial_soc=float(soc_ov.get("initial_soc", STORAGE_DEFAULT_INITIAL_SOC)),
                     solar_kw=self._day_data["solar_kw"],
                     max_power_kw_series=self._day_data.get("storage_power_limit_kw"),
                     ambient_temp_c_series=self._day_data["weather"]["temp_c"],
-                    **({"terminal_soc": float(terminal_soc)} if terminal_soc is not None else {}),
+                    terminal_soc=float(soc_ov.get("terminal_soc", STORAGE_DEFAULT_TERMINAL_SOC)),
                 )
                 report = self._add_report(
                     AgentType.STORAGE,
@@ -1590,6 +1998,7 @@ class SimulationEngine:
                     {**self._storage_plan, "report_detail": self._build_report_detail("storage", self._storage_plan)},
                 )
                 self._bind_gate("storage_approval", report, f"revised saving {self._storage_plan['saving_cny']:.0f}")
+                self._sync_realtime_soc_to_plan()
             if target in ("hvac", "overview"):
                 self._hvac_plan = optimize_hvac_dispatch(
                     self._day_data["hvac_load_kw"],
@@ -1605,13 +2014,21 @@ class SimulationEngine:
                     {**self._hvac_plan, "report_detail": self._build_report_detail("hvac", self._hvac_plan)},
                 )
                 self._bind_gate("hvac_approval", report, f"revised saving {self._hvac_plan['saving_cny']:.0f}")
+            # In realtime phase, facility modifications reset the approval
+            # gates. Re-approve them so dispatch stays consistent and the
+            # operator can still submit realtime overrides afterwards.
+            if self._dispatch_enabled:
+                if target in ("storage", "overview"):
+                    await self._submit_approval_locked("storage_approval", "approve", "facility-revised", action.decided_by or "facility")
+                if target in ("hvac", "overview"):
+                    await self._submit_approval_locked("hvac_approval", "approve", "facility-revised", action.decided_by or "facility")
 
     async def _apply_realtime_override_locked(self, action: FacilityAction, actor: str) -> None:
         """Apply a real-time setpoint override through the control-action path."""
         setpoints = action.parameters.get("setpoints", {})
         system = action.target_system
         if system == "storage":
-            await self.submit_control_action(
+            await self._submit_control_action_locked(
                 system="storage",
                 action="manual_override",
                 target="power_kw",
@@ -1622,7 +2039,7 @@ class SimulationEngine:
             )
         elif system == "hvac":
             if "supply_temp_c" in setpoints:
-                await self.submit_control_action(
+                await self._submit_control_action_locked(
                     system="hvac",
                     action="manual_override",
                     target="supply_temp_c",
@@ -1632,7 +2049,7 @@ class SimulationEngine:
                     actor=actor,
                 )
             if "power_kw" in setpoints:
-                await self.submit_control_action(
+                await self._submit_control_action_locked(
                     system="hvac",
                     action="manual_override",
                     target="power_kw",
@@ -1869,15 +2286,16 @@ class SimulationEngine:
             "reports": [report.model_dump(mode="json") for report in self._reports[-20:]],
             "alerts": [alert.model_dump(mode="json") for alert in self._alerts[-50:]],
             "series": {key: list(value) for key, value in self._series_cache.items()},
-            "day_ahead": {
-                "load_forecast": dd.get("load_forecast", dd.get("load_kw", [])),
-                "storage_plan": self._storage_plan["power_kw"] if self._storage_plan else [],
-                "soc_plan": self._storage_plan["soc_ratio"] if self._storage_plan else [],
-                "hvac_plan": self._hvac_plan["power_kw"] if self._hvac_plan else [],
-                "price": dd.get("price_cny_per_kwh", []),
-                "carbon_c": self._carbon_data["c_factors"] if self._carbon_data else [],
-                "carbon_cr": self._carbon_data["cr_factors"] if self._carbon_data else [],
-            },
+           "day_ahead": {
+               "load_forecast": dd.get("load_forecast", dd.get("load_kw", [])),
+               "storage_plan": self._storage_plan["power_kw"] if self._storage_plan else [],
+               "soc_plan": self._storage_plan["soc_ratio"] if self._storage_plan else [],
+               "hvac_plan": self._hvac_plan["power_kw"] if self._hvac_plan else [],
+               "price": dd.get("price_cny_per_kwh", []),
+               "tariff_periods": dd.get("tariff_periods", []),
+               "carbon_c": self._carbon_data["c_factors"] if self._carbon_data else [],
+               "carbon_cr": self._carbon_data["cr_factors"] if self._carbon_data else [],
+           },
             "storage_summary": self._storage_plan,
             "hvac_summary": self._hvac_plan,
             "tariff_summary": self._tariff_data,
@@ -1911,8 +2329,15 @@ class SimulationEngine:
             "active_strategy": {
                 "demand_cap_kw": self._demand_cap_kw,
                 "enabled": self._demand_cap_kw is not None,
+                "monthly_peak_kw": self._monthly_peak_kw,
                 "objective_mode": self._objective_mode,
             },
+            "storage_soc_config": {
+                "default_initial_soc": STORAGE_DEFAULT_INITIAL_SOC,
+                "default_terminal_soc": STORAGE_DEFAULT_TERMINAL_SOC,
+                "daily_override": self._daily_soc_override,
+            },
+            "pending_day_plan": self.get_pending_day_plan(),
         }
 
     def _get_checkpoint_view(self) -> dict[str, Any]:

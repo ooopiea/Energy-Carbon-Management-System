@@ -1,52 +1,58 @@
-# Python
+# Allow only the deployable application and its root deployment files.
+/*
+!/.gitignore
+!/.dockerignore
+!/.env.example
+!/README.md
+!/Dockerfile
+!/docker-compose.yml
+!/backend/
+!/frontend/
+
+# Never commit local datasets or generated runtime data.
+backend/data/
+backend/work/
+
+# Python generated files and environments
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.egg
+.eggs/
 dist/
 build/
-.eggs/
-*.egg
 .venv/
 venv/
 env/
 
-# Node
+# Node generated files and dependencies
 node_modules/
 frontend/dist/
 frontend/build/
+frontend/.vite/
+*.tsbuildinfo
 
-# IDE
+# Local environment files
+.env
+.env.*
+!/.env.example
+
+# IDE and editor state
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
-# Runtime data (source data under backend/data/raw is intentionally versioned)
-backend/data/archive/
-*.pyc
-
-# Env
-.env
-.env.local
-.env.*.local
-
-# Logs
+# Logs and test caches
 *.log
 logs/
-
-# Test/Cache
 .pytest_cache/
+backend/.pytest-tmp/
 .ruff_cache/
 .mypy_cache/
 coverage/
 htmlcov/
-
-# Build artifacts
-backend/data/processed/*.parquet
-
-# Test temp directory
-backend/work/

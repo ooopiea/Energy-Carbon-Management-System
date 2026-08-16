@@ -29,6 +29,10 @@ class EnergyRuntime(Protocol):
     async def propose_facility_action(self, **kwargs: Any) -> Any: ...
     async def preview_day_ahead_modification(self, **kwargs: Any) -> dict[str, Any]: ...
     async def preview_realtime_override(self, **kwargs: Any) -> dict[str, Any]: ...
+    def get_pending_day_plan(self) -> dict[str, Any] | None: ...
+    def preview_next_day_modification(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def apply_next_day_modification(self, **kwargs: Any) -> Any: ...
+    async def revise_facility_action(self, proposal_id: str, parameters: dict[str, Any], actor: str) -> dict[str, Any]: ...
 
 
 _SYSTEM_DESIGN: dict[str, str] = {
@@ -101,14 +105,15 @@ FACILITY_TOOLS: list[dict[str, Any]] = [
     }},
     {"type": "function", "function": {
         "name": "modify_day_ahead_plan",
-        "description": "Propose day-ahead parameter changes (objective mode, terminal SOC, power limit windows, chiller overrides, carbon price). Only available in day_ahead phase. Returns before/after preview; user must confirm.",
+        "description": "Modify the next-day (D+1) day-ahead plan parameters (objective mode, terminal SOC, power limit windows, chiller overrides, carbon price). Available in both day_ahead and realtime phases. Returns before/after preview; user must confirm.",
         "parameters": {"type": "object", "properties": {
             "target_system": {"type": "string", "enum": ["storage", "hvac", "overview"]},
             "objective_mode": {"type": "string", "enum": ["min_cost", "min_carbon", "weighted"],
                 "description": "min_cost=savings; min_carbon=CO2 reduction; weighted=balanced"},
-            "parameters": {"type": "object", "description": "Only fill fields the user explicitly specified.",
-                "properties": {
-                    "terminal_soc": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "Target end-of-day SOC ratio"},
+           "parameters": {"type": "object", "description": "Only fill fields the user explicitly specified.",
+               "properties": {
+                   "initial_soc": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "Day start SOC ratio, default 0.10"},
+                   "terminal_soc": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "Target end-of-day SOC ratio"},
                     "power_limit_windows": {"type": "array", "description": "Time windows (step 0-95) to limit storage power.",
                         "items": {"type": "object", "properties": {
                             "start_step": {"type": "integer", "minimum": 0, "maximum": 95},
@@ -216,6 +221,7 @@ class FacilityChatService:
         event_ids: list[str] = []
         facility_action_ids: list[str] = []
         tool_trace: list[dict[str, Any]] = []
+        reasoning_text: str = ""
         delegation: list[dict[str, Any]] = []
         mission_result: dict[str, Any] | None = None
         mode = "glm"
@@ -228,13 +234,25 @@ class FacilityChatService:
                     for item in history[-14:] if item["role"] in {"user", "assistant"}
                 )
                 tools = FACILITY_TOOLS if role == "facility" else ENGINEER_TOOLS
-                first = await self.glm.complete(conversation, tools)
-                content = first.content
-                if first.tool_calls:
-                    conversation.append(first.as_assistant_message())
-                    for call in first.tool_calls:
-                        result = await self._execute_tool(call, actor, role, message, session_id)
-                        tool_trace.append({"name": call.name, "result": result})
+                # Multi-turn tool-calling loop: keep invoking tools until GLM
+                # stops requesting them (or we hit the safety ceiling).
+                max_rounds = 6
+                content = ""
+                for _round in range(max_rounds):
+                    msg = await self.glm.complete(conversation, tools)
+                    if msg.reasoning:
+                        reasoning_text = msg.reasoning
+                    if msg.content.strip():
+                        content = msg.content
+                    if not msg.tool_calls:
+                        break
+                    conversation.append(msg.as_assistant_message())
+                    for call in msg.tool_calls:
+                        try:
+                            result = await self._execute_tool(call, actor, role, message, session_id)
+                        except Exception as tool_exc:
+                            result = {"error": f"tool {call.name} failed: {tool_exc}"}
+                        tool_trace.append({"name": call.name, "summary": self._tool_result_summary(call.name, result), "result": result})
                         if isinstance(result, dict):
                             if result.get("event_id"):
                                 event_ids.append(result["event_id"])
@@ -245,23 +263,23 @@ class FacilityChatService:
                                 mission_result = result["mission_result"]
                         conversation.append({"role": "tool", "tool_call_id": call.id,
                             "content": json.dumps(result, ensure_ascii=False, default=str)})
-                    final = await self.glm.complete(conversation, tools, max_tokens=1000)
-                    content = final.content
                 if not content.strip():
                     content = self._tool_summary(tool_trace)
                 self._last_error = None
-            except (GlmError, ValueError, TypeError) as exc:
+            except Exception as exc:
                 self._last_error = str(exc)
-                content, fallback_events, fallback_delegation = await self._fallback(message, actor, role)
+                content, fallback_events, fallback_delegation, fallback_fa_ids = await self._fallback(message, actor, role)
                 event_ids.extend(fallback_events)
                 delegation.extend(fallback_delegation)
+                facility_action_ids.extend(fallback_fa_ids)
                 mode = "rule_fallback"
         else:
-            content, event_ids, delegation = await self._fallback(message, actor, role)
+            content, event_ids, delegation, fallback_fa_ids = await self._fallback(message, actor, role)
+            facility_action_ids.extend(fallback_fa_ids)
             mode = "rule_fallback"
         assistant_record = self._record("assistant", content, role, "\u5382\u52a1\u52a9\u624b")
         assistant_record.update({"event_ids": event_ids, "facility_action_ids": facility_action_ids,
-            "tool_trace": tool_trace, "mode": mode})
+            "tool_trace": tool_trace, "mode": mode, "reasoning": reasoning_text})
         history.append(assistant_record)
         self._sessions[session_key] = history[-60:]
         events = [e for e in self.runtime.get_disturbance_events(50) if e["event_id"] in set(event_ids)]
@@ -323,9 +341,9 @@ class FacilityChatService:
             "\u6bcf\u4e2a\u52a8\u4f5c\u5fc5\u987b\u5e26 reasoning \u548c confidence\u3002",
         ]
         if phase == "day_ahead":
-            constraints.append("\u5f53\u524d\u4e3a\u65e5\u524d\u9636\u6bb5: \u53ef\u7528 modify_day_ahead_plan\u3001set_demand_cap\u3001propose_disturbance\u3001coordinate_energy_agents\u3002")
+            constraints.append("\u5f53\u524d\u4e3a\u65e5\u524d\u9636\u6bb5: \u53ef\u7528 modify_day_ahead_plan\uff08\u4fee\u6539\u6b21\u65e5 D+1 \u65b9\u6848\uff09\u3001set_demand_cap\u3001propose_disturbance\u3001coordinate_energy_agents\u3002")
         else:
-            constraints.append("\u5f53\u524d\u4e3a\u5b9e\u65f6\u9636\u6bb5: \u53ef\u7528 submit_realtime_override\u3001set_demand_cap\u3001propose_disturbance\u3001coordinate_energy_agents\u3002")
+            constraints.append("\u5f53\u524d\u4e3a\u5b9e\u65f6\u9636\u6bb5: \u53ef\u7528 modify_day_ahead_plan\uff08\u4fee\u6539\u6b21\u65e5 D+1 \u65b9\u6848\uff09\u3001submit_realtime_override\u3001set_demand_cap\u3001propose_disturbance\u3001coordinate_energy_agents\u3002")
         return constraints
 
     async def _execute_tool(self, call: GlmToolCall, actor: str, role: str, source_text: str, session_id: str) -> dict[str, Any]:
@@ -358,23 +376,38 @@ class FacilityChatService:
         return {"error": "unsupported tool: " + name}
 
     async def _tool_modify_day_ahead(self, args: dict[str, Any], actor: str) -> dict[str, Any]:
-        phase = self.runtime.get_current_phase()
-        if phase != "day_ahead":
-            return {"error": "modify_day_ahead_plan only available in day_ahead phase; current: " + phase}
-        target_system = str(args.get("target_system", "storage"))
-        objective_mode = str(args.get("objective_mode", "weighted"))
+        # Route to D+1 next-day plan if available; otherwise fall back to
+        # a current-day modification proposal so the closed loop always
+        # produces an approval suggestion.
+        target_system = str(args.get("target_system", "overview"))
+        objective_mode = str(args.get("objective_mode", ""))
         parameters = dict(args.get("parameters") or {})
         reasoning = str(args.get("reasoning", ""))
         confidence = float(args.get("confidence", 0.85))
-        preview = await self.runtime.preview_day_ahead_modification(
+        pending = self.runtime.get_pending_day_plan()
+        if pending is None:
+            preview = await self.runtime.preview_day_ahead_modification(
+                target_system=target_system, objective_mode=objective_mode, parameters=parameters)
+            full_params: dict[str, Any] = dict(parameters)
+            if objective_mode:
+                full_params["objective_mode"] = objective_mode
+            action = await self.runtime.propose_facility_action(
+                action_type="day_ahead_modification", target_system=target_system,
+                parameters=full_params, reasoning=reasoning,
+                confidence=confidence, impact_preview=preview, actor=actor)
+            return {"proposal_id": action.proposal_id, "action_type": "day_ahead_modification",
+                "target_system": target_system, "preview": preview, "status": action.status,
+                "target_day": None,
+                "message": "当前日前方案修改提案已生成，含前后对比预览。确认后重新优化并绑定审批门。"}
+        preview = self.runtime.preview_next_day_modification(
             target_system=target_system, objective_mode=objective_mode, parameters=parameters)
-        action = await self.runtime.propose_facility_action(
-            action_type="day_ahead_modification", target_system=target_system,
-            parameters={**parameters, "objective_mode": objective_mode},
-            reasoning=reasoning, confidence=confidence, impact_preview=preview, actor=actor)
+        action = await self.runtime.apply_next_day_modification(
+            target_system=target_system, objective_mode=objective_mode,
+            parameters=parameters, reasoning=reasoning, confidence=confidence, actor=actor)
         return {"proposal_id": action.proposal_id, "action_type": "day_ahead_modification",
             "target_system": target_system, "preview": preview, "status": action.status,
-            "message": "Day-ahead modification proposed with before/after preview. User must confirm."}
+            "target_day": pending["target_day"], "target_date": pending["target_date"],
+            "message": f"次日(D+1, {pending['target_date']})日前方案已修改，含前后对比预览。确认后次日生效。"}
 
     async def _tool_realtime_override(self, args: dict[str, Any], actor: str) -> dict[str, Any]:
         phase = self.runtime.get_current_phase()
@@ -454,7 +487,17 @@ class FacilityChatService:
             "pending_facility_actions": [i for i in state.get("facility_actions", []) if i["status"] == "proposed"][:10],
         }
 
-    async def _fallback(self, text: str, actor: str, role: str) -> tuple[str, list[str], list[dict[str, Any]]]:
+    async def _fallback(self, text: str, actor: str, role: str) -> tuple[str, list[str], list[dict[str, Any]], list[str]]:
+        facility_action_ids: list[str] = []
+        # Try facility action parsing first for facility role.
+        if role == "facility":
+            fa = await self._try_facility_action_fallback(text, actor)
+            if fa is not None:
+                proposal_id, fa_type, content = fa
+                facility_action_ids.append(proposal_id)
+                delegation = self.runtime.coordinate_agents(text) if any(
+                    kw in text for kw in ("\u534f\u540c", "\u5206\u6790", "\u4f18\u5316\u534f\u8c03")) else []
+                return (content, [], delegation, facility_action_ids)
         parsed = self._parse_disturbance(text)
         should_delegate = role == "facility" and any(
             kw in text.lower() for kw in ("agent", "\u5904\u7406\u65b9\u6848", "\u5e2e\u5fd9", "\u89e3\u51b3", "\u8c03\u5ea6", "\u5206\u6790", "\u4f18\u5316", "\u98ce\u9669"))
@@ -475,15 +518,15 @@ class FacilityChatService:
                     + "\uff09\uff0c15\u5206\u949f\u7c92\u5ea6\uff1b\u5ba1\u6279\u5f85\u529e " + str(len(pending)) + " \u9879\uff08" + ", ".join(pending)
                     + "\uff09\uff0c\u5de5\u4f5c\u6d41 " + str(snapshot["workflow"]["status"])
                     + "\uff1b\u8d1f\u8377 " + load_s + " kW\u3001SOC " + soc_s
-                    + "\uff0c\u672a\u786e\u8ba4\u544a\u8b66 " + str(len(alerts)) + " \u9879\u3002GLM " + configured + "\u3002", [], delegation)
+                   + "\uff0c\u672a\u786e\u8ba4\u544a\u8b66 " + str(len(alerts)) + " \u9879\u3002GLM " + configured + "\u3002", [], delegation, facility_action_ids)
             if delegation:
                 summary = "\uff1b".join(i["label"] + "\uff1a" + i["finding"] for i in delegation)
-                return ("\u5df2\u8c03\u5ea6 Agent\u3002\u5904\u7406\u65b9\u6848\uff1a" + summary, [], delegation)
+                return ("\u5df2\u8c03\u5ea6 Agent\u3002\u5904\u7406\u65b9\u6848\uff1a" + summary, [], delegation, facility_action_ids)
             load_s = format(current["load_kw"], ".0f")
             soc_s = format(current["storage_soc"], ".1%")
             return ("\u4eff\u771f\u65f6\u95f4 " + str(snapshot["time"]["sim_time"]) + "\uff0c\u9636\u6bb5 " + str(phase)
                 + "\uff0c\u8d1f\u8377 " + load_s + " kW\uff0cSOC " + soc_s
-                + "\u3002\u544a\u8b66 " + str(len(alerts)) + " \u9879\uff1bGLM " + configured + "\u3002", [], delegation)
+                + "\u3002\u544a\u8b66 " + str(len(alerts)) + " \u9879\uff1bGLM " + configured + "\u3002", [], delegation, facility_action_ids)
         event = await self.runtime.propose_disturbance(actor=actor, actor_role=role, source_text=text,
             parsed_by="rule_fallback", confidence=parsed.pop("confidence"), **parsed)
         delegation_copy = ""
@@ -491,7 +534,137 @@ class FacilityChatService:
             delegation_copy = " \u5904\u7406\u65b9\u6848\uff1a" + "\uff1b".join(i["label"] + "\uff1a" + i["finding"] for i in delegation) + "\u3002"
         return ("\u5df2\u6574\u7406\u4e3a\u4e8b\u4ef6\u8349\u6848\uff1a" + event.summary
             + "\u3002\u5c1a\u672a\u6539\u53d8\u8c03\u5ea6\uff1b\u6838\u5bf9\u540e\u70b9\u201c\u786e\u8ba4\u5e76\u91cd\u7b97\u201d\u3002" + delegation_copy,
-            [event.event_id], delegation)
+            [event.event_id], delegation, facility_action_ids)
+
+    async def _try_facility_action_fallback(
+        self, text: str, actor: str
+    ) -> tuple[str, str, str] | None:
+        """Rule-based facility action parser for fallback mode.
+
+        Detects day-ahead modifications, demand caps, and realtime overrides
+        from natural language.  Returns (proposal_id, action_type, content) or None.
+        """
+        phase = self.runtime.get_current_phase()
+        lower = text.lower()
+        params: dict[str, Any] = {}
+        action_type: str | None = None
+        target_system = "overview"
+        objective_mode = ""
+
+        # --- Demand cap ---
+        cap_match = re.search(r"(\d[\d,]*)\s*(?:kW|kw|MW|mw)", text)
+        if any(kw in text for kw in ("\u9700\u91cf", "\u4e0a\u9650")) and cap_match:
+            val = float(cap_match.group(1).replace(",", ""))
+            if "MW" in text or "mw" in text:
+                val *= 1000
+            action_type = "demand_cap"
+            params["demand_cap_kw"] = val
+            obj = re.search(r"(\u7535\u8d39|\u4f4e\u78b3|\u52a0\u6743)", text)
+            if obj:
+                objective_mode = "min_cost" if "\u7535\u8d39" in obj.group(1) else "min_carbon" if "\u4f4e\u78b3" in obj.group(1) else "weighted"
+            content = "\u9700\u91cf\u9650\u5236 " + format(val, ".0f") + " kW\u5df2\u751f\u6210\u63d0\u6848\uff0c\u8bf7\u786e\u8ba4\u540e\u751f\u6548\u3002"
+
+        # --- Day-ahead objective mode ---
+        elif any(kw in text for kw in ("\u7701\u94b1", "\u7535\u8d39\u6700\u4f18", "\u6700\u5c0f\u6210\u672c", "\u7701\u94b1\u4f18\u5148")):
+            action_type = "day_ahead_modification"
+            target_system = "storage" if "\u50a8\u80fd" in text else "overview"
+            objective_mode = "min_cost"
+            soc_m = re.search(r"(?:\u672b\u7aef|\u7ed3\u675f)\s*SOC?\s*(\d+(?:\.\d+)?)\s*%?", text, re.I)
+            if soc_m:
+                params["terminal_soc"] = min(0.9, max(0.1, float(soc_m.group(1)) / (100 if float(soc_m.group(1)) > 1 else 1)))
+            content = "\u50a8\u80fd\u4f18\u5316\u76ee\u6807\u6539\u4e3a\u201c\u7701\u94b1\u4f18\u5148\u201d" + ("\uff0c\u672b\u7aefSOC " + format(params["terminal_soc"], ".0%") if "terminal_soc" in params else "") + "\u3002\u5df2\u751f\u6210\u524d/\u540e\u5bf9\u6bd4\u9884\u89c8\uff0c\u8bf7\u786e\u8ba4\u540e\u91cd\u8dd1\u4f18\u5316\u3002"
+
+        elif any(kw in text for kw in ("\u4f4e\u78b3", "\u78b3\u6392", "\u4f4e\u78b3\u4f18\u5148")):
+            action_type = "day_ahead_modification"
+            target_system = "storage" if "\u50a8\u80fd" in text else "overview"
+            objective_mode = "min_carbon"
+            content = "\u50a8\u80fd\u4f18\u5316\u76ee\u6807\u6539\u4e3a\u201c\u4f4e\u78b3\u4f18\u5148\u201d\u3002\u5df2\u751f\u6210\u524d/\u540e\u5bf9\u6bd4\u9884\u89c8\uff0c\u8bf7\u786e\u8ba4\u540e\u91cd\u8dd1\u4f18\u5316\u3002"
+
+        elif any(kw in text for kw in ("\u52a0\u6743", "\u7efc\u5408")):
+            action_type = "day_ahead_modification"
+            target_system = "storage" if "\u50a8\u80fd" in text else "overview"
+            objective_mode = "weighted"
+            content = "\u50a8\u80fd\u4f18\u5316\u76ee\u6807\u6539\u4e3a\u201c\u7535\u8d39+\u78b3\u6392\u52a0\u6743\u201d\u3002\u5df2\u751f\u6210\u524d/\u540e\u5bf9\u6bd4\u9884\u89c8\uff0c\u8bf7\u786e\u8ba4\u540e\u91cd\u8dd1\u4f18\u5316\u3002"
+
+        # --- Realtime override ---
+        elif phase == "realtime" and any(kw in text for kw in ("\u653e\u7535", "\u5145\u7535", "\u8bbe\u5b9a", "\u8986\u76d6", "\u8c03\u6574")):
+            power_m = re.search(r"(\d[\d,]*)\s*(?:kW|kw|MW|mw)", text)
+            temp_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:\u00b0?C|\u5ea6)", text)
+            setpoints: dict[str, Any] = {}
+            if power_m:
+                pv = float(power_m.group(1).replace(",", ""))
+                if "MW" in text or "mw" in text:
+                    pv *= 1000
+                if "\u5145\u7535" in text:
+                    pv = -pv
+                setpoints["power_kw"] = pv
+            if temp_m:
+                setpoints["supply_temp_c"] = float(temp_m.group(1))
+            if not setpoints:
+                return None
+            action_type = "realtime_override"
+            target_system = "storage" if "\u50a8\u80fd" in text else "hvac" if any(k in text for k in ("\u7a7a\u8c03", "\u51b7\u673a", "HVAC", "hvac")) else "storage"
+            content = "\u5b9e\u65f6\u8986\u76d6\u8bbe\u5b9a\u503c\u5df2\u751f\u6210\u63d0\u6848\uff0c\u8bf7\u786e\u8ba4\u540e\u6267\u884c\u3002"
+
+        if action_type is None:
+            return None
+
+        # Build proposal via runtime methods.
+        try:
+            if action_type == "day_ahead_modification":
+                full_params: dict[str, Any] = dict(params)
+                if objective_mode:
+                    full_params["objective_mode"] = objective_mode
+                pending = self.runtime.get_pending_day_plan()
+                if pending is None:
+                    # No pending D+1 plan: fall back to current-day modification.
+                    preview = await self.runtime.preview_day_ahead_modification(
+                        target_system=target_system,
+                        objective_mode=objective_mode or "weighted",
+                        parameters=params,
+                    )
+                    action = await self.runtime.propose_facility_action(
+                        action_type=action_type, target_system=target_system,
+                        parameters=full_params, reasoning=text.strip()[:240],
+                        confidence=0.75, impact_preview=preview, actor=actor,
+                    )
+                else:
+                    preview = self.runtime.preview_next_day_modification(
+                        target_system=target_system,
+                        objective_mode=objective_mode or "weighted",
+                        parameters=params,
+                    )
+                    action = await self.runtime.apply_next_day_modification(
+                        target_system=target_system,
+                        objective_mode=objective_mode or "weighted",
+                        parameters=params, reasoning=text.strip()[:240],
+                        confidence=0.75, actor=actor,
+                    )
+            elif action_type == "realtime_override":
+                preview = await self.runtime.preview_realtime_override(
+                    target_system=target_system, setpoints=setpoints,
+                )
+                action = await self.runtime.propose_facility_action(
+                    action_type=action_type, target_system=target_system,
+                    parameters={"setpoints": setpoints}, reasoning=text.strip()[:240],
+                    confidence=0.75, impact_preview=preview, actor=actor,
+                )
+            elif action_type == "demand_cap":
+                full_params = dict(params)
+                if objective_mode:
+                    full_params["objective_mode"] = objective_mode
+                preview = {"demand_cap_kw": params["demand_cap_kw"], "objective_mode": objective_mode or "unchanged"}
+                action = await self.runtime.propose_facility_action(
+                    action_type=action_type, target_system="overview",
+                    parameters=full_params, reasoning=text.strip()[:240],
+                    confidence=0.75, impact_preview=preview, actor=actor,
+                )
+            else:
+                return None
+        except Exception:
+            return None
+
+        return (action.proposal_id, action_type, content)
 
     def _parse_disturbance(self, text: str) -> dict[str, Any] | None:
         keywords = ("\u6545\u969c", "\u505c\u673a", "\u6062\u590d", "\u8d1f\u8377", "\u6e29\u5ea6", "\u7535\u4ef7", "\u6392\u73ed", "\u505c\u4ea7", "\u589e\u4ea7")
@@ -541,7 +714,37 @@ class FacilityChatService:
     def _record(role: str, content: str, actor_role: str, actor: str) -> dict[str, Any]:
         return {"message_id": "msg-" + uuid.uuid4().hex[:10], "role": role, "actor_role": actor_role,
             "actor": actor, "content": content, "created_at": datetime.now().astimezone().isoformat(),
-            "event_ids": [], "facility_action_ids": [], "tool_trace": [], "mode": "user" if role == "user" else "glm"}
+            "event_ids": [], "facility_action_ids": [], "tool_trace": [], "mode": "user" if role == "user" else "glm",
+            "reasoning": ""}
+
+    @staticmethod
+    def _tool_result_summary(name: str, result: Any) -> str:
+        """Extract a one-line human-readable summary from a tool result."""
+        if not isinstance(result, dict):
+            return str(result)[:120]
+        if result.get("error"):
+            return f"error: {result['error']}"
+        if result.get("proposal_id"):
+            preview = result.get("preview", {})
+            after = preview.get("after", {})
+            metric_hint = ""
+            if isinstance(after, dict):
+                parts = [f"{k}={v:.0f}" for k, v in list(after.items())[:3] if isinstance(v, (int, float))]
+                metric_hint = f" ({', '.join(parts)})" if parts else ""
+            return f"proposed {result.get('action_type', name)}{metric_hint}"
+        if result.get("event_id"):
+            return f"event draft: {result.get('summary', '')[:60]}"
+        if result.get("mission_result"):
+            return "mission coordination completed"
+        if name == "get_system_snapshot":
+            cur = result.get("current", {})
+            return f"load={cur.get('load_kw', 0):.0f}kW, SOC={cur.get('storage_soc', 0):.1%}, phase={result.get('current_phase', '?')}"
+        if name == "get_system_design":
+            return f"topic: {result.get('topic', '?')}"
+        if name == "list_disturbances":
+            items = result.get("disturbances", [])
+            return f"{len(items)} disturbance events"
+        return str(result)[:120]
 
     @staticmethod
     def _tool_summary(trace: list[dict[str, Any]]) -> str:

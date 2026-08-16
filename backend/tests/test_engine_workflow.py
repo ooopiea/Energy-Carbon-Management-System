@@ -103,21 +103,48 @@ async def test_reset_clears_runtime_and_starts_fresh_pending_workflow(tmp_path):
         "peak_kw": 0.0,
     }
     assert state["series"] == {}
-    assert state["storage_soc"] == pytest.approx(0.5)
+    assert state["storage_soc"] == pytest.approx(0.10)
     assert state["physical_dispatch"]["last_execution"] is None
     assert state["approval_gates"]["forecast_approval"]["status"] == "pending_approval"
 
 
 @pytest.mark.asyncio
-async def test_new_day_inherits_previous_actual_storage_soc(tmp_path):
+async def test_promoted_pending_plan_syncs_realtime_soc(tmp_path):
+    """Cross-day model: auto-approved D+1 plan promotes on start_day, syncing SOC."""
     engine = SimulationEngine(archive_root=tmp_path)
     await engine.start_day(0)
     engine._current_values["storage_soc"] = 0.37
 
     await engine.start_day(1)
+    state = engine.get_state()
+    summary = state["storage_summary"]
+    # Promoted plan syncs SOC to the plan's initial_soc immediately.
+    assert state["storage_soc"] == pytest.approx(summary["initial_soc"])
+    assert summary["initial_soc"] == pytest.approx(0.10)
+    assert summary["terminal_soc_target"] == pytest.approx(0.10)
+    # Promotion activates dispatch and all gates.
+    assert state["physical_dispatch"]["enabled"] is True
+    for gate in ("forecast_approval", "storage_approval", "hvac_approval"):
+        assert state["approval_gates"][gate]["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_fallback_path_carries_over_realtime_soc(tmp_path):
+    """When no approved pending plan exists, SOC carries over until forecast approval."""
+    engine = SimulationEngine(archive_root=tmp_path)
+    await engine.start_day(0)
+    engine._current_values["storage_soc"] = 0.37
+    # Simulate unapproved / missing pending plan — force the fallback path.
+    engine._pending_day_plan = None
+
+    await engine.start_day(1)
+    # Fallback path has no storage plan yet, so carryover SOC is preserved.
     assert engine.get_state()["storage_soc"] == pytest.approx(0.37)
 
     await engine.submit_approval("forecast_approval", "approve", actor="tester")
-    summary = engine.get_state()["storage_summary"]
-    assert summary["initial_soc"] == pytest.approx(0.37)
-    assert summary["terminal_soc_target"] == pytest.approx(0.37)
+    state = engine.get_state()
+    summary = state["storage_summary"]
+    # After the storage agent runs, realtime SOC aligns to the plan's initial_soc.
+    assert state["storage_soc"] == pytest.approx(summary["initial_soc"])
+    assert summary["initial_soc"] == pytest.approx(0.10)
+    assert summary["terminal_soc_target"] == pytest.approx(0.10)

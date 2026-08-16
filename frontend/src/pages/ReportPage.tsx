@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { ArrowLeft, CheckCircle2, FileCheck2, ShieldAlert, Table2, XCircle } from 'lucide-react'
 import { useAppStore } from '../stores/appStore'
 import { statusLabel } from '../components/Layout'
+import ReactECharts from 'echarts-for-react'
 
 type ReportDetail = {
   kind: 'forecast' | 'storage' | 'hvac'
@@ -18,6 +19,60 @@ const LABELS: Record<string, string> = {
   load_kw: '负荷(kW)', price_cny_per_kwh: '电价(元/kWh)', forecast_kw: '负荷指标(kW)',
   power_kw: '功率(kW)', soc_ratio: 'SOC', temperature_c: '温度(°C)', grid_kw: '电网功率(kW)',
   active_chillers: '冷机(台)', cop: 'COP', supply_temp_c: '供水(°C)', return_temp_c: '回水(°C)',
+}
+
+function ForecastChart({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const times = rows.map(r => String(r.time))
+  const values = rows.map(r => Number(r.forecast_kw))
+  return <ReactECharts option={{
+    tooltip: { trigger: 'axis' },
+    grid: { left: 58, right: 18, top: 30, bottom: 30 },
+    xAxis: { type: 'category', data: times, axisLabel: { fontSize: 9, interval: 11 } },
+    yAxis: { type: 'value', name: 'kW', axisLabel: { fontSize: 9 } },
+    series: [{ name: '负荷预测', type: 'line', smooth: true, symbol: 'none', data: values, lineStyle: { width: 2, color: '#176b87' }, areaStyle: { color: 'rgba(23,107,135,.08)' } }],
+  }} style={{ height: 240 }} />
+}
+
+function StorageChart({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const times = rows.map(r => String(r.time))
+  const powerValues = rows.map(r => Number(r.power_kw))
+  const socValues = rows.map(r => Number((Number(r.soc_ratio) * 100).toFixed(1)))
+  return <ReactECharts option={{
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['储能功率', 'SOC'], top: 4, textStyle: { fontSize: 10 } },
+    grid: { left: 58, right: 58, top: 36, bottom: 30 },
+    xAxis: { type: 'category', data: times, axisLabel: { fontSize: 9, interval: 11 } },
+    yAxis: [
+      { type: 'value', name: 'kW', axisLabel: { fontSize: 9 } },
+      { type: 'value', name: '%', min: 0, max: 100, axisLabel: { fontSize: 9 } },
+    ],
+    series: [
+      { name: '储能功率', type: 'line', smooth: true, symbol: 'none', yAxisIndex: 0, data: powerValues, lineStyle: { width: 2, color: '#d97706' } },
+      { name: 'SOC', type: 'line', smooth: true, symbol: 'none', yAxisIndex: 1, data: socValues, lineStyle: { width: 2, color: '#15803d' }, areaStyle: { color: 'rgba(21,128,61,.06)' } },
+    ],
+  }} style={{ height: 240 }} />
+}
+
+function HvacChart({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const times = rows.map(r => String(r.time))
+  const powerValues = rows.map(r => Number(r.power_kw))
+  const copValues = rows.map(r => Number(r.cop))
+  const chillerValues = rows.map(r => Number(r.active_chillers))
+  return <ReactECharts option={{
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['HVAC功率', 'COP', '冷机台数'], top: 4, textStyle: { fontSize: 10 } },
+    grid: { left: 58, right: 58, top: 36, bottom: 30 },
+    xAxis: { type: 'category', data: times, axisLabel: { fontSize: 9, interval: 11 } },
+    yAxis: [
+      { type: 'value', name: 'kW', axisLabel: { fontSize: 9 } },
+      { type: 'value', name: 'COP', axisLabel: { fontSize: 9 } },
+    ],
+    series: [
+      { name: 'HVAC功率', type: 'line', smooth: true, symbol: 'none', yAxisIndex: 0, data: powerValues, lineStyle: { width: 2, color: '#1688a7' } },
+      { name: 'COP', type: 'line', smooth: true, symbol: 'none', yAxisIndex: 1, data: copValues, lineStyle: { width: 2, color: '#6d5b8c' } },
+      { name: '冷机台数', type: 'bar', yAxisIndex: 0, data: chillerValues, itemStyle: { color: 'rgba(22,136,167,.2)' } },
+    ],
+  }} style={{ height: 240 }} />
 }
 
 export function ReportPage() {
@@ -47,6 +102,9 @@ export function ReportPage() {
     {detail ? <>
       <section className="report-metrics">{detail.key_metrics.map(metric => <div key={metric.label}><span>{metric.label}</span><strong>{formatValue(metric.value, metric.unit)}</strong></div>)}</section>
       <ReportTable title="今日排班与负荷背景" icon={<Table2 />} rows={detail.schedule_table} columns={['time', 'shift', 'production_intensity', 'load_kw', 'price_cny_per_kwh']} />
+      {detail.kind === 'forecast' && <section className="report-chart"><ForecastChart rows={detail.plan_table} /></section>}
+      {detail.kind === 'storage'  && <section className="report-chart"><StorageChart rows={detail.plan_table} /></section>}
+      {detail.kind === 'hvac'     && <section className="report-chart"><HvacChart rows={detail.plan_table} />{detail.kind === 'hvac' && <p className="chart-note">该图表基于日前调度计划生成，未来将接入现有调度系统以实现实时更新与闭环反馈。</p>}</section>}
       <ReportTable title="调度方案明细" icon={<FileCheck2 />} rows={detail.plan_table} columns={detail.kind === 'forecast' ? ['time', 'shift', 'production_intensity', 'forecast_kw'] : detail.kind === 'storage' ? ['time', 'power_kw', 'soc_ratio', 'temperature_c', 'grid_kw'] : ['time', 'power_kw', 'active_chillers', 'cop', 'supply_temp_c', 'return_temp_c']} />
       <section className="report-risk"><h2><ShieldAlert />边界、风险与假设</h2>{detail.risks.length ? <ul>{detail.risks.map((risk, index) => <li key={index}>{typeof risk === 'string' ? risk : JSON.stringify(risk)}</li>)}</ul> : <p>未发现计划约束越限。</p>}</section>
     </> : <section className="report-risk"><h2>情况概述</h2><p>{report.content}</p><pre>{JSON.stringify(report.data, null, 2)}</pre></section>}

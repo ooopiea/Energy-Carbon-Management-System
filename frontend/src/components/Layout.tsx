@@ -1,9 +1,10 @@
-import { type ReactNode, useEffect } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import { useAppStore } from '../stores/appStore'
 import {
-  Workflow, LayoutDashboard, BatteryCharging, Wind, Pause, Play, RotateCcw,
+  Workflow, LayoutDashboard, BatteryCharging, Battery, Wind, Pause, Play, RotateCcw,
   Wifi, WifiOff, PanelRightClose, PanelRightOpen, Zap, CheckCircle2, XCircle,
-  MessageSquareText,
+  MessageSquareText, Lock, SlidersHorizontal, Fan, Snowflake,
+  type LucideIcon, ChevronDown,
 } from 'lucide-react'
 import { OverviewPanel } from '../panels/OverviewPanel'
 import { AgentFlowPanel } from '../panels/AgentFlowPanel'
@@ -11,12 +12,37 @@ import { StoragePanel } from '../panels/StoragePanel'
 import { HVACPanel } from '../panels/HVACPanel'
 import { FacilityChatPanel } from '../panels/FacilityChatPanel'
 
-const NAV_ITEMS = [
-  { id: 'overview', label: '综合可视化', icon: LayoutDashboard },
-  { id: 'facility_chat', label: '厂务协同', icon: MessageSquareText },
-  { id: 'agent_flow', label: 'Agent 流程', icon: Workflow },
-  { id: 'storage', label: '储能系统', icon: BatteryCharging },
-  { id: 'hvac', label: 'HVAC 系统', icon: Wind },
+
+type NavLeaf = {
+  kind: 'leaf'
+  id: string
+  label: string
+  icon: LucideIcon
+}
+
+type NavGroup = {
+  kind: 'group'
+  id: string
+  label: string
+  icon: LucideIcon
+  children: NavLeaf[]
+}
+
+type NavItem = NavLeaf | NavGroup
+
+const NAV_ITEMS: NavItem[] = [
+  { kind: 'leaf', id: 'overview', label: '综合可视化', icon: LayoutDashboard },
+  { kind: 'leaf', id: 'facility_chat', label: 'AI厂务协同', icon: MessageSquareText },
+  { kind: 'leaf', id: 'agent_flow', label: 'AI协作流程', icon: Workflow },
+  { kind: 'leaf', id: 'fixed_load', label: '不可调负荷', icon: Lock },
+  { kind: 'group', id: 'adjustable', label: '可调负荷', icon: SlidersHorizontal, children: [
+    { kind: 'leaf', id: 'hvac', label: '暖通空调', icon: Wind },
+    { kind: 'leaf', id: 'compressor', label: '空压机', icon: Fan },
+  ]},
+  { kind: 'group', id: 'storage_group', label: '储能设备', icon: BatteryCharging, children: [
+    { kind: 'leaf', id: 'storage', label: '电池储能', icon: Battery },
+    { kind: 'leaf', id: 'ice_storage', label: '蓄冷', icon: Snowflake },
+  ]},
 ]
 
 export function statusColor(status: string): string {
@@ -68,6 +94,7 @@ function DispatchRail() {
   const state = useAppStore(s => s.state)
   const step = Math.max(0, Math.min(95, state?.time.step ?? 0))
   const prices = state?.day_ahead.price ?? []
+  const periods = state?.day_ahead.tariff_periods ?? []
   const max = Math.max(...prices, 1)
   return (
     <div className="dispatch-rail" aria-label={`96点调度轨，当前第 ${step + 1} 点`}>
@@ -78,7 +105,7 @@ function DispatchRail() {
       <div className="rail-track" role="img" aria-label="全天分时电价与当前仿真位置">
         {Array.from({ length: 96 }, (_, i) => {
           const price = prices[i] ?? 0
-          const level = price / max > .8 ? 'sharp' : price / max > .55 ? 'peak' : price / max < .35 ? 'valley' : 'flat'
+          const level = periods[i] ?? 'flat'
           return <span key={i} className={`${level} ${i === step ? 'current' : ''}`} title={`${String(Math.floor(i / 4)).padStart(2, '0')}:${String(i % 4 * 15).padStart(2, '0')} · ${price.toFixed(3)} 元/kWh`} />
         })}
       </div>
@@ -109,6 +136,12 @@ export function ActionHistory({ limit = 5 }: { limit?: number }) {
 
 export function Layout({ children }: { children: ReactNode }) {
   const { activePage, setActivePage, rightPanelCollapsed, toggleRightPanel, state, connectionState, pause, resume, reset, loadState, errorMessage, fetchState, operationMessage, clearOperationMessage } = useAppStore()
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  const toggleGroup = (gid: string) => setCollapsedGroups(prev => {
+    const next = new Set(prev)
+    if (next.has(gid)) next.delete(gid); else next.add(gid)
+    return next
+  })
   const isPaused = state?.time.paused ?? false
   useEffect(() => {
     if (!operationMessage) return
@@ -137,11 +170,26 @@ export function Layout({ children }: { children: ReactNode }) {
     <div className={`app-shell ${rightPanelCollapsed ? 'panel-is-collapsed' : ''}`}>
       <aside className="sidebar" aria-label="主导航">
         <div className="brand"><div className="brand-mark"><Zap /></div><div className="brand-copy"><strong>黄花园区</strong><span>调度控制台</span></div></div>
-        <nav>{NAV_ITEMS.map(item => { const Icon = item.icon; const active = activePage === item.id; return (
-          <button key={item.id} onClick={() => setActivePage(item.id)} className={active ? 'active' : ''} aria-current={active ? 'page' : undefined} title={item.label}>
-            <Icon /><span>{item.label}</span>
-          </button>
-        ) })}</nav>
+        <nav>{NAV_ITEMS.map(item => {
+          if (item.kind === 'leaf') {
+            const Icon = item.icon; const active = activePage === item.id
+            return <button key={item.id} onClick={() => setActivePage(item.id)} className={active ? 'active' : ''} aria-current={active ? 'page' : undefined} title={item.label}>
+              <Icon /><span>{item.label}</span>
+            </button>
+          }
+          const GIcon = item.icon; const isCollapsed = collapsedGroups.has(item.id)
+          return <div key={item.id} className="nav-group">
+            <button className={`nav-group-header ${isCollapsed ? '' : 'open'}`} onClick={() => toggleGroup(item.id)} title={item.label}>
+              <GIcon /><span>{item.label}</span><ChevronDown className="nav-chevron" />
+            </button>
+            {!isCollapsed && item.children.map(child => {
+              const Icon = child.icon; const active = activePage === child.id
+              return <button key={child.id} onClick={() => setActivePage(child.id)} className={`nav-child ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} title={child.label}>
+                <Icon /><span>{child.label}</span>
+              </button>
+            })}
+          </div>
+        })}</nav>
         <div className="time-controls">
           <span className="connection"><i className={connectionState} />{connectionState === 'connected' ? <Wifi /> : <WifiOff />}<b>{connectionState === 'connected' ? '实时连接' : connectionState === 'reconnecting' ? '正在重连' : connectionState === 'connecting' ? '正在连接' : '连接中断'}</b></span>
           <div className="control-row">
