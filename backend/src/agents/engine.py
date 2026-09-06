@@ -99,6 +99,7 @@ class SimulationEngine:
         glm_client: GlmClient | None = None,
         state_repo: StateRepository | None = None,
         resume_run_id: str | None = None,
+        simulation_loop: bool | None = None,
     ):
         self._rng = random.Random(123)
         self._constraints = PhysicsConstraints()
@@ -106,8 +107,27 @@ class SimulationEngine:
         self._data_start = data_start
         self._data_end = data_end
         self._data_range_provenance = data_range_provenance
+        if simulation_loop is None:
+            simulation_loop = get_env("ENERGY_SIMULATION_LOOP", "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+        self._simulation_loop = bool(simulation_loop)
+        self._simulation_day_count = (
+            (data_end - data_start).days + 1
+            if data_start is not None and data_end is not None and data_end >= data_start
+            else 0
+        )
+        loop_end = (
+            datetime.combine(data_end + timedelta(days=1), datetime.min.time())
+            if self._simulation_loop and data_end is not None
+            else None
+        )
         resolved_start = datetime.combine(data_start, datetime.min.time()) if data_start else None
-        self._time = time_engine or get_time_engine(resolved_start)
+        self._time = time_engine or get_time_engine(resolved_start, loop_end_time=loop_end)
+        if time_engine is not None and loop_end is not None and hasattr(time_engine, "configure_loop"):
+            time_engine.configure_loop(loop_end)
         self._archive = ArchiveStore(archive_root)
         self._executor = executor or SimulationExecutor()
         self._tick_engine = RealtimeTickEngine(executor=self._executor, rng=self._rng)
@@ -187,6 +207,7 @@ class SimulationEngine:
         self._pending_overrides = {}
         self._init_nodes()
         self._pending_day_plan: PendingDayPlan | None = None
+        self._last_cycle = getattr(self._time, "cycle_count", 0)
 
     def _restore_from_checkpoint(self, run_id: str) -> bool:
         """Restore workflow state from a saved checkpoint (G4 restart-resume).
@@ -399,6 +420,8 @@ class SimulationEngine:
 
     def _generate_next_day_plan_locked(self, next_day: int) -> None:
         """Pre-generate D+1 day-ahead plan for review and approval during D-day."""
+        if self._simulation_loop and next_day >= self._simulation_day_count:
+            return
         sim_time = self._time.sim_time
         next_date = sim_time.date() + timedelta(days=1)
         try:
@@ -509,7 +532,11 @@ class SimulationEngine:
         async with self._transition_lock:
             day = self._time.day_count
             step = self._time.current_step
-            if day != self._last_day:
+            cycle = getattr(self._time, "cycle_count", 0)
+            if cycle != self._last_cycle:
+                self._clear_all_state()
+                await self._start_day_locked(day)
+            elif day != self._last_day:
                 await self._start_day_locked(day)
             if step != self._last_step and self._day_data:
                 start_step = 0 if self._last_step < 0 else self._last_step + 1
@@ -2409,6 +2436,13 @@ class SimulationEngine:
             "started_at": self._started_at.isoformat(),
             "workflow_status": self._workflow_state.get("workflow_status", "idle"),
             "agent_llm": self._reasoning.status(),
+            "simulation_loop": {
+                "enabled": self._simulation_loop,
+                "data_start": self._data_start.isoformat() if self._data_start else None,
+                "data_end": self._data_end.isoformat() if self._data_end else None,
+                "days_per_cycle": self._simulation_day_count,
+                "cycle": getattr(self._time, "cycle_count", 0),
+            },
         }
 
     async def _broadcast_once(self) -> None:

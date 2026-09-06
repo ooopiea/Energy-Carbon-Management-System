@@ -8,6 +8,8 @@ export interface TimeInfo {
   progress: number
   paused: boolean
   time_scale: number
+  cycle?: number
+  loop_enabled?: boolean
 }
 
 export interface AgentNode {

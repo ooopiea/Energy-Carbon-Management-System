@@ -14,6 +14,7 @@
 - 智谱 GLM OpenAI 兼容接入：五个 Agent 的事实解释、工程师项目反馈，以及厂务目标请求自动调度专业 Agent。
 - 故障、负荷、天气、电价和排班变化先形成事件草案；人工确认后重算并重新进入审批链。
 - 仿真时钟从 `用电负荷_1h.xlsx` 中满足小时契约的最早实际日期 `2025-11-01` 启动。
+- 可选 `ENERGY_SIMULATION_LOOP=true`：时钟运行到负载数据最后一天后，自动回到第一天并开启新的 run / 审批链；历史归档保留。
 - Prediction 兼容节点把小时实际负荷转换为 15 分钟指标，并加入逐小时能量守恒的确定性扰动，不伪装成未来预测。
 
 ## 架构
@@ -71,6 +72,7 @@ docker compose up --build
 ```
 
 归档数据写入具名卷 `energy-archive`。容器健康检查访问 `/api/health`。
+独立域名、HTTPS、扫码访问和循环运行的完整上线步骤见 [部署指南](docs/DEPLOYMENT.md)。
 
 ## 验证
 
@@ -90,6 +92,7 @@ npm.cmd --prefix .\frontend run build
 | `ENERGY_DATA_RAW_DIR` | `backend/data/raw` | 内置原始数据目录，可覆盖为挂载路径 |
 | `ENERGY_CORS_ORIGINS` | 本地 5173 | 逗号分隔的允许来源 |
 | `ENERGY_AUTO_APPROVE` | `false` | 是否自动审批；生产必须保持 `false` |
+| `ENERGY_SIMULATION_LOOP` | `false` | 是否在数据末日 24:00 自动回到数据首日循环运行 |
 | `ZAI_API_KEY` | 空 | 智谱 API Key；兼容读取 `ZHIPU_API_KEY` / `GLM_API_KEY` |
 | `GLM_BASE_URL` | `https://open.bigmodel.cn/api/paas/v4/` | 智谱官方 OpenAI 兼容端点 |
 | `GLM_MODEL` | `glm-5.2` | 支持工具调用的 GLM 模型，可按账号权限覆盖 |

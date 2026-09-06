@@ -99,7 +99,7 @@ function DispatchRail() {
   return (
     <div className="dispatch-rail" aria-label={`96点调度轨，当前第 ${step + 1} 点`}>
       <div className="rail-meta">
-        <div><span className="eyebrow">黄花园区 · 数据起点 {state?.data_timeline?.start ?? '读取中'} · 200×</span><strong>{state ? formatTime(state.time.sim_time) : '等待系统时间'}</strong></div>
+        <div><span className="eyebrow">黄花园区 · 数据起点 {state?.data_timeline?.start ?? '读取中'} · 200×{state?.time.cycle ? ` · 第 ${state.time.cycle + 1} 轮` : ''}</span><strong>{state ? formatTime(state.time.sim_time) : '等待系统时间'}</strong></div>
         <div className="rail-step"><span>当前步</span><strong>{String(step + 1).padStart(2, '0')}</strong><small>/ 96</small></div>
       </div>
       <div className="rail-track" role="img" aria-label="全天分时电价与当前仿真位置">

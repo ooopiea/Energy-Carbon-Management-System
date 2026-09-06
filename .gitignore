@@ -6,6 +6,15 @@
 !/README.md
 !/Dockerfile
 !/docker-compose.yml
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/ci.yml
+!/docs/
+/docs/*
+!/docs/DEPLOYMENT.md
+!/docs/DEPLOYMENT.md
 !/backend/
 !/frontend/
 
